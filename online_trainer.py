@@ -800,9 +800,23 @@ def collect_validation_rollout_even(
     conn.close()
 
     if os.path.exists(merged_tel_path):
-        count = sum(1 for _ in open(merged_tel_path))
-        if count >= target_samples:
-            return merged_tel_path, monty_db_path
+        valid_schema = False
+        try:
+            with open(merged_tel_path, "r") as f:
+                first_line = f.readline()
+                if first_line.strip():
+                    sample = json.loads(first_line.strip())
+                    if sample.get("moves") and "picker_rank" in sample["moves"][0]:
+                        valid_schema = True
+        except Exception:
+            valid_schema = False
+
+        if valid_schema:
+            count = sum(1 for _ in open(merged_tel_path))
+            if count >= target_samples:
+                return merged_tel_path, monty_db_path
+        else:
+            os.remove(merged_tel_path)
 
     samples_per_fen = max(1, math.ceil(target_samples / len(val_fens_pool)))
     sample_interval = max(1000, nodes_per_fen // samples_per_fen)
@@ -1347,7 +1361,7 @@ def main():
         target_samples=args.val_samples,
         nodes_per_fen=args.nodes,
         workers=args.workers,
-        session_tag="val_streamed_500k_shared"
+        session_tag="val_v3_staged_500k_shared"
     )
 
     val_dataset = RolloutDataset(
