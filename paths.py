@@ -19,7 +19,7 @@ def get_repo_root() -> str:
     Identifies the base repository root directory:
     1. SF_REPO_ROOT environment variable (if set).
     2. Current working directory if it contains 'Stockfish' or 'tools'.
-    3. Traversal from this file's location: tools/mini-NN-lmr/../../
+    3. Traversal from this file's location: tools/stockfish-mini-policy-NN-prototype/../../
     4. Fallback to THIS_DIR if running standalone.
     """
     if "SF_REPO_ROOT" in os.environ and os.path.isdir(os.environ["SF_REPO_ROOT"]):
@@ -38,20 +38,10 @@ def get_repo_root() -> str:
 
 REPO_ROOT = get_repo_root()
 
-# Primary monorepo relative paths
 DEFAULT_REL_PATHS = {
     "stockfish_bin": os.path.join("Stockfish", "src", "stockfish"),
     "monty_bin": os.path.join("tools", "Monty", "monty"),
     "epd_file": os.path.join("scratch", "popular_ajedrezdata_maxPlies60.epd.scored"),
-    "cache_dir": "scratch",
-    "calibration_config": os.path.join("tools", "stockfish-mini-policy-NN-prototype", "calibration_config.json")
-}
-
-# Standalone internal deps relative paths (inside stockfish-mini-policy-NN-prototype repo)
-INTERNAL_REL_PATHS = {
-    "stockfish_bin": os.path.join("deps", "Stockfish", "src", "stockfish"),
-    "monty_bin": os.path.join("deps", "Monty", "monty"),
-    "epd_file": os.path.join("data", "popular_ajedrezdata_maxPlies60.epd.scored"),
     "cache_dir": "scratch",
     "calibration_config": "calibration_config.json"
 }
@@ -94,45 +84,80 @@ _LOADED_CONFIG = load_paths_config()
 
 def resolve_path(key: str, default_rel: Optional[str] = None) -> str:
     """
-    Resolves a file/directory path:
-    1. Checks if `key` is present in paths_config.json.
-    2. If present and absolute -> uses it if exists, else checks relative.
-    3. Checks internal `deps/` path (inside this repo).
-    4. Checks monorepo fallback relative path from REPO_ROOT.
+    Resolves a file/directory path with multi-tier automatic discovery:
+    1. paths_config.json custom override (if file exists).
+    2. Internal standalone deps (e.g. deps/Stockfish/src/stockfish, deps/Monty/monty).
+    3. Monorepo sibling paths (e.g. Stockfish/src/stockfish, tools/Monty/monty).
+    4. Sane default path.
     """
-    monorepo_rel = default_rel or DEFAULT_REL_PATHS.get(key, "")
-    monorepo_abs = os.path.abspath(os.path.join(REPO_ROOT, monorepo_rel)) if monorepo_rel else ""
-
-    internal_rel = INTERNAL_REL_PATHS.get(key, "")
-    internal_abs = os.path.abspath(os.path.join(THIS_DIR, internal_rel)) if internal_rel else ""
-
     cfg_val = _LOADED_CONFIG.get(key)
     if cfg_val:
-        if os.path.isabs(cfg_val):
-            if os.path.exists(cfg_val):
-                return cfg_val
-            if monorepo_abs and os.path.exists(monorepo_abs):
-                return monorepo_abs
-            if internal_abs and os.path.exists(internal_abs):
-                return internal_abs
-            return cfg_val
-        else:
-            # Check relative to REPO_ROOT or THIS_DIR
-            c1 = os.path.abspath(os.path.join(REPO_ROOT, cfg_val))
-            if os.path.exists(c1):
-                return c1
-            c2 = os.path.abspath(os.path.join(THIS_DIR, cfg_val))
-            if os.path.exists(c2):
-                return c2
-            return c1
+        candidates = [
+            cfg_val if os.path.isabs(cfg_val) else "",
+            os.path.abspath(os.path.join(REPO_ROOT, cfg_val)),
+            os.path.abspath(os.path.join(THIS_DIR, cfg_val)),
+        ]
+        for c in candidates:
+            if c and os.path.exists(c):
+                return c
 
-    # Check existence in monorepo vs internal deps
-    if monorepo_abs and os.path.exists(monorepo_abs):
-        return monorepo_abs
-    if internal_abs and os.path.exists(internal_abs):
-        return internal_abs
+    if key == "stockfish_bin":
+        candidates = [
+            os.path.abspath(os.path.join(THIS_DIR, "deps", "Stockfish", "src", "stockfish")),
+            os.path.abspath(os.path.join(THIS_DIR, "Stockfish", "src", "stockfish")),
+            os.path.abspath(os.path.join(REPO_ROOT, "Stockfish", "src", "stockfish")),
+            os.path.abspath(os.path.join(REPO_ROOT, "deps", "Stockfish", "src", "stockfish")),
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
 
-    return monorepo_abs or internal_abs
+    elif key == "monty_bin":
+        candidates = [
+            os.path.abspath(os.path.join(THIS_DIR, "deps", "Monty", "monty")),
+            os.path.abspath(os.path.join(THIS_DIR, "Monty", "monty")),
+            os.path.abspath(os.path.join(THIS_DIR, "tools", "Monty", "monty")),
+            os.path.abspath(os.path.join(REPO_ROOT, "tools", "Monty", "monty")),
+            os.path.abspath(os.path.join(REPO_ROOT, "Monty", "monty")),
+            os.path.abspath(os.path.join(REPO_ROOT, "deps", "Monty", "monty")),
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
+
+    elif key == "calibration_config":
+        candidates = [
+            os.path.abspath(os.path.join(THIS_DIR, "calibration_config.json")),
+            os.path.abspath(os.path.join(REPO_ROOT, "tools", "stockfish-mini-policy-NN-prototype", "calibration_config.json")),
+            os.path.abspath(os.path.join(REPO_ROOT, "calibration_config.json")),
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
+
+    elif key == "epd_file":
+        candidates = [
+            os.path.abspath(os.path.join(THIS_DIR, "data", "popular_ajedrezdata_maxPlies60.epd.scored")),
+            os.path.abspath(os.path.join(THIS_DIR, "scratch", "popular_ajedrezdata_maxPlies60.epd.scored")),
+            os.path.abspath(os.path.join(REPO_ROOT, "scratch", "popular_ajedrezdata_maxPlies60.epd.scored")),
+            os.path.abspath(os.path.join(REPO_ROOT, "data", "popular_ajedrezdata_maxPlies60.epd.scored")),
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
+
+    elif key == "cache_dir":
+        candidates = [
+            os.path.abspath(os.path.join(THIS_DIR, "scratch")),
+            os.path.abspath(os.path.join(REPO_ROOT, "scratch")),
+        ]
+        for c in candidates:
+            if os.path.isdir(c):
+                return c
+        return os.path.abspath(os.path.join(THIS_DIR, "scratch"))
+
+    monorepo_rel = default_rel or DEFAULT_REL_PATHS.get(key, "")
+    return os.path.abspath(os.path.join(REPO_ROOT, monorepo_rel))
 
 
 # Standardized Resolved Paths
