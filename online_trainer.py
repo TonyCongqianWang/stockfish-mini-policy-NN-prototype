@@ -468,7 +468,9 @@ def compute_combined_losses(
 
     # 3. LMR Force 1: Move-Order Dependent Search Allocation on Top Monty Move (Detached Scores)
     scores = z_mp.detach() * 32768.0
-    masked_s = scores.masked_fill(~legal_mask, -1e9)
+    stage_offset = torch.where(is_cap_mask, 1_000_000.0, 0.0)
+    staged_scores = scores + stage_offset
+    masked_s = staged_scores.masked_fill(~legal_mask, -1e9)
     s_star = masked_s.gather(1, i_star.unsqueeze(1))
 
     score_diff = masked_s - s_star
@@ -531,7 +533,7 @@ def compute_combined_losses(
     loss_lmr_total = lmr_ord_coef * loss_lmr_order + rank_profile_coef * loss_rank_profile + push_up_coef * loss_push_up
     loss_total = loss_mp_total + loss_lmr_total
 
-    mp_top1_acc = (masked_z.argmax(dim=-1) == i_star).float().mean()
+    mp_top1_acc = (masked_s.argmax(dim=-1) == i_star).float().mean()
     mean_q_star = Q_star.mean()
 
     return loss_total, loss_mp_kl, loss_mp_shape, loss_lmr_order, loss_rank_profile, loss_push_up, mp_top1_acc, mean_q_star
@@ -560,8 +562,9 @@ def evaluate_handcrafted_master(
             min_red = torch.tensor(-2.0, device=r_legacy.device)
             r_real_leg = torch.minimum(torch.maximum(r_legacy, min_red), max_red)
 
-            # Master LMR Move-Order Allocation
-            scores = z_legacy_mp * 32768.0
+            # Master LMR Move-Order Allocation with Stage Offsets
+            stage_offset = torch.where(is_cap, 1_000_000.0, 0.0)
+            scores = z_legacy_mp * 32768.0 + stage_offset
             masked_s = scores.masked_fill(~legal_mask, -1e9)
             s_star = masked_s.gather(1, i_star.unsqueeze(1))
 
@@ -586,7 +589,7 @@ def evaluate_handcrafted_master(
             Q_star = p_first * Q_k0 + (1.0 - p_first) * Q_k
             loss_lmr_order = -(torch.log(Q_star + 1e-12)).mean()
 
-            mp_top1_acc = (masked_z.argmax(dim=-1) == i_star).float().mean()
+            mp_top1_acc = (masked_s.argmax(dim=-1) == i_star).float().mean()
             effort_leg_late = (E.sum(dim=-1) - E_star).mean()
             mean_r = r_real_leg[legal_mask].mean()
 
@@ -1056,6 +1059,10 @@ def run_heldout_online_evaluation(
     total_positions = 0
     top1_matches = 0
     top3_matches = 0
+    monty_top1_red_sum = 0.0
+    monty_top1_count = 0
+    late_moves_red_sum = 0.0
+    late_moves_count = 0
 
     if os.path.exists(tel_path):
         with open(tel_path, "r") as f:
@@ -1075,18 +1082,41 @@ def run_heldout_online_evaluation(
                 m_poly = monty_policies[fen]
                 sorted_monty = sorted(m_poly.keys(), key=lambda m: m_poly[m], reverse=True)
 
-                if sorted_monty and top_cpp_move == sorted_monty[0]:
-                    top1_matches += 1
-                if sorted_monty and top_cpp_move in sorted_monty[:3]:
-                    top3_matches += 1
+                if sorted_monty:
+                    top_monty_move = sorted_monty[0]
+                    if top_cpp_move == top_monty_move:
+                        top1_matches += 1
+                    if top_cpp_move in sorted_monty[:3]:
+                        top3_matches += 1
+
+                    depth_val = s.get("depth", 8)
+                    for m_idx, m_info in enumerate(moves):
+                        rank_val = m_info.get("picker_rank", m_idx + 1)
+                        if rank_val == 1:
+                            r_val = 0.0
+                        else:
+                            base_r = (math.log(max(1, depth_val)) * math.log(max(1, rank_val)) * 500.0) / 1024.0
+                            r_val = base_r
+
+                        if m_info["move"] == top_monty_move:
+                            monty_top1_red_sum += r_val
+                            monty_top1_count += 1
+                        elif rank_val >= 2:
+                            late_moves_red_sum += r_val
+                            late_moves_count += 1
+
                 total_positions += 1
 
     top1_pct = (top1_matches / max(1, total_positions)) * 100.0
     top3_pct = (top3_matches / max(1, total_positions)) * 100.0
+    mean_top1_r = monty_top1_red_sum / max(1, monty_top1_count)
+    mean_late_r = late_moves_red_sum / max(1, late_moves_count)
 
-    print(f"Heldout Positions Evaluated: {total_positions:,}", flush=True)
-    print(f"Physical C++ Move 1 == Monty Top-1 Match: {top1_pct:.2f}%", flush=True)
-    print(f"Physical C++ Move 1 in Monty Top-3 Match:  {top3_pct:.2f}%", flush=True)
+    print(f"Heldout Positions Evaluated:                {total_positions:,}", flush=True)
+    print(f"Physical C++ Move 1 == Monty Top-1 Match:   {top1_pct:.2f}%", flush=True)
+    print(f"Physical C++ Move 1 in Monty Top-3 Match:   {top3_pct:.2f}%", flush=True)
+    print(f"Mean LMR Reduction on Monty Top-1 Move:     {mean_top1_r:.2f} plies", flush=True)
+    print(f"Mean LMR Reduction on Other Late Moves:     {mean_late_r:.2f} plies", flush=True)
     print("=" * 80 + "\n", flush=True)
 
     if os.path.exists(temp_model_path):
@@ -1095,6 +1125,8 @@ def run_heldout_online_evaluation(
     return {
         "heldout_top1_match": top1_pct,
         "heldout_top3_match": top3_pct,
+        "heldout_top1_reduction": mean_top1_r,
+        "heldout_late_reduction": mean_late_r,
         "heldout_total_pos": total_positions
     }
 
@@ -1278,15 +1310,15 @@ def main():
     parser.add_argument("--lr", type=float, default=4e-3, help="Peak learning rate (default: 4e-3)")
     parser.add_argument("--mp-anchor-coef", type=float, default=0.20, help="MovePicker anchor weight (default: 0.20)")
     parser.add_argument("--lmr-ord-coef", type=float, default=0.40, help="LMR order loss weight with detached scores (default: 0.40)")
-    parser.add_argument("--rank-profile-coef", type=float, default=0.20, help="Rank profile MSE loss weight (default: 0.20)")
-    parser.add_argument("--push-up-coef", type=float, default=0.050, help="Lean tree upward push weight (default: 0.050)")
+    parser.add_argument("--rank-profile-coef", type=float, default=0.40, help="Rank profile MSE loss weight (default: 0.40)")
+    parser.add_argument("--push-up-coef", type=float, default=0.065, help="Lean tree upward push weight (default: 0.065)")
     parser.add_argument("--output", type=str, default="floored_dual_64it.miniNN", help="Output model binary path")
 
     args = parser.parse_args()
     t_lmr, t_mp, floor_lmr, floor_mp = load_calibration_parameters()
 
     print("=" * 80, flush=True)
-    print("   ON-POLICY CLOSED-LOOP DUAL MINI-NN TRAINER (RESIDUAL ARCHITECTURE - 5E-2 PUSH)", flush=True)
+    print("   ON-POLICY CLOSED-LOOP DUAL MINI-NN TRAINER (RESIDUAL ARCHITECTURE - 6.5E-2 PUSH)", flush=True)
     print("=" * 80, flush=True)
     print(f"Total Iterations:            {args.iterations:,}", flush=True)
     print(f"Validation Frequency:        Every {args.val_freq} iterations", flush=True)
@@ -1350,13 +1382,13 @@ def main():
     if args.grid:
         grid_configs = [
             {
-                "name": "Run1_Residual_LMR40_Push5e2",
+                "name": "Run1_Residual_LMR40_Push6e2",
                 "lr": 4e-3,
                 "mp_anchor": 0.20,
                 "lmr_ord": 0.40,
-                "rank_profile": 0.20,
-                "push_up": 0.050,
-                "output": "floored_dual_push5e2_run1.miniNN"
+                "rank_profile": 0.40,
+                "push_up": 0.065,
+                "output": "floored_dual_push6e2_run1.miniNN"
             },
         ]
 
