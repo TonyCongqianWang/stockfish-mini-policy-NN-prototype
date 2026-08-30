@@ -48,6 +48,7 @@ from dataset import (
     extract_lmr_features_from_data,
     extract_lmr_raw_features,
     extract_node_features,
+    extract_node_features_from_data,
     extract_quiet_features,
     extract_quiet_features_from_data,
 )
@@ -319,18 +320,20 @@ class RolloutDataset(Dataset):
                     continue
 
                 # Depth-Independent Node Features (with cut_node and pv_node)
-                prev_stat_score = s.get("prev_stat_score", 0)
-                cutoff_cnt = s.get("cutoff_cnt", 1)
-                u_node = extract_node_features(
-                    board,
-                    ply=ply,
-                    improving=improving,
-                    cut_node=cut_node,
-                    pv_node=pv_node,
-                    static_eval=static_eval,
-                    prev_stat_score=prev_stat_score,
-                    cutoff_cnt=cutoff_cnt
-                )
+                u_node = extract_node_features_from_data(s)
+                if u_node is None:
+                    prev_stat_score = s.get("prev_stat_score", 0)
+                    cutoff_cnt = s.get("cutoff_cnt", 1)
+                    u_node = extract_node_features(
+                        board,
+                        ply=ply,
+                        improving=improving,
+                        cut_node=cut_node,
+                        pv_node=pv_node,
+                        static_eval=static_eval,
+                        prev_stat_score=prev_stat_score,
+                        cutoff_cnt=cutoff_cnt
+                    )
 
                 num_moves = min(len(moves_info), MAX_LEGAL_MOVES)
                 if num_moves < 3:

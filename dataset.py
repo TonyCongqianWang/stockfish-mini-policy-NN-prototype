@@ -65,7 +65,15 @@ def extract_node_features(
 PIECE_VALS = {1: 100, 2: 300, 3: 300, 4: 500, 5: 900, 6: 0}
 
 
+def extract_node_features_from_data(s: dict) -> Optional[torch.Tensor]:
+    if "u_node" in s:
+        return torch.from_numpy(np.array(s["u_node"], dtype=np.float32) / 64.0)
+    return None
+
+
 def extract_quiet_features_from_data(m_data: dict, ply: int = 16) -> torch.Tensor:
+    if "x_quiet" in m_data:
+        return torch.from_numpy(np.array(m_data["x_quiet"], dtype=np.float32) / 64.0)
     x = np.zeros(12, dtype=np.float32)
     x[0] = np.clip(m_data.get("main_hist", 0) / 16384.0, -1.0, 1.0)
     x[1] = np.clip(m_data.get("pawn_hist", 0) / 16384.0, -1.0, 1.0)
@@ -83,6 +91,8 @@ def extract_quiet_features_from_data(m_data: dict, ply: int = 16) -> torch.Tenso
 
 
 def extract_capture_features_from_data(m_data: dict) -> torch.Tensor:
+    if "x_cap" in m_data:
+        return torch.from_numpy(np.array(m_data["x_cap"], dtype=np.float32) / 64.0)
     x = np.zeros(4, dtype=np.float32)
     x[0] = np.clip(m_data.get("capt_hist", 0) / 16384.0, -1.0, 1.0)
     cap_val = PIECE_VALS.get(m_data.get("captured_pt", 0), 100)
@@ -94,6 +104,8 @@ def extract_capture_features_from_data(m_data: dict) -> torch.Tensor:
 
 
 def extract_lmr_features_from_data(m_data: dict, tt_pv: bool = False) -> torch.Tensor:
+    if "x_lmr" in m_data:
+        return torch.from_numpy(np.array(m_data["x_lmr"], dtype=np.float32) / 64.0)
     x = np.zeros(8, dtype=np.float32)
     x[0] = np.clip(m_data.get("stat_score", 0) / 2000.0, -1.0, 1.0)
     rank = m_data.get("picker_rank", 1)
