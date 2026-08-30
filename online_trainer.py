@@ -641,7 +641,7 @@ def evaluate_validation_rollout(
             total_count += B
             tot_loss_sum += loss.item() * B
             mp_kl_sum += loss_mp_kl.item() * B
-            mp_anc_sum += loss_mp_anc.item() * B
+            mp_anc_sum += loss_mp_shape.item() * B
             lmr_ord_sum += loss_lmr_ord.item() * B
             rank_prof_loss_sum += loss_rank_prof.item() * B
             push_loss_sum += loss_push.item() * B

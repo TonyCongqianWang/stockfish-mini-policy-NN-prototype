@@ -4,6 +4,7 @@ Standardizes node and move features into [-1.0, 1.0] matching C++ SIMD inference
 """
 
 import math
+from typing import Dict, List, Optional, Tuple
 import chess
 import numpy as np
 import torch
