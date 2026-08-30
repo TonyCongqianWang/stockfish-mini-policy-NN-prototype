@@ -11,13 +11,30 @@ Mini-NN Engine Architecture (Version 3 with Full Activation QAT):
 5. Symmetric Quantization with Straight-Through Estimator (STE) across weights, biases, and activations.
 """
 
+import json
 import math
+import os
 import struct
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Dict
+
+from paths import CALIB_CONFIG_PATH
+
+
+def get_default_calib_temperatures() -> Tuple[float, float]:
+    t_mp, t_lmr = 0.11539, 0.86580
+    if os.path.exists(CALIB_CONFIG_PATH):
+        try:
+            with open(CALIB_CONFIG_PATH, "r") as f:
+                cfg = json.load(f)
+            t_mp = float(cfg.get("t_calib_mp", 0.11539))
+            t_lmr = float(cfg.get("t_calib_lmr", 0.86580))
+        except Exception:
+            pass
+    return t_mp, t_lmr
 
 
 class SymmetricQuantizeSTE(torch.autograd.Function):
@@ -51,9 +68,17 @@ class QuantizedClippedReLU(nn.Module):
 
 
 class NodeNetwork(nn.Module):
-    def __init__(self, in_dim=16, hidden_dim=32, out_dim=26, scale=64.0):
+    def __init__(self, in_dim=16, hidden_dim=32, out_dim=26, scale=64.0, tau_mp_base=None, tau_lmr_base=None):
         super().__init__()
         self.scale = scale
+        if tau_mp_base is None or tau_lmr_base is None:
+            def_mp, def_lmr = get_default_calib_temperatures()
+            self.tau_mp_base = def_mp if tau_mp_base is None else tau_mp_base
+            self.tau_lmr_base = def_lmr if tau_lmr_base is None else tau_lmr_base
+        else:
+            self.tau_mp_base = tau_mp_base
+            self.tau_lmr_base = tau_lmr_base
+
         self.fc0 = nn.Linear(in_dim, hidden_dim)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, out_dim)
@@ -81,13 +106,13 @@ class NodeNetwork(nn.Module):
         # 16..23: 8 position latents for captures & LMR (scale 64, range [-127/64, 127/64])
         z_latents = quantize_ste(torch.clamp(out[:, 16:24], -127.0 / 64.0, 127.0 / 64.0), 64.0)
 
-        # 24: log_tau_mp (Base calibration ~0.1154)
+        # 24: log_tau_mp (loaded dynamically from calib_config.json)
         log_tau_mp = out[:, 24:25]
-        tau_mp = 0.1154 * torch.exp(torch.clamp(log_tau_mp, -1.5, 1.5))
+        tau_mp = self.tau_mp_base * torch.exp(torch.clamp(log_tau_mp, -1.5, 1.5))
 
-        # 25: log_tau_lmr (Base calibration ~0.8658)
+        # 25: log_tau_lmr (loaded dynamically from calib_config.json)
         log_tau_lmr = out[:, 25:26]
-        tau_lmr = 0.8658 * torch.exp(torch.clamp(log_tau_lmr, -1.5, 1.5))
+        tau_lmr = self.tau_lmr_base * torch.exp(torch.clamp(log_tau_lmr, -1.5, 1.5))
 
         return w_quiet, z_latents, tau_mp, tau_lmr
 
@@ -107,8 +132,11 @@ class QuietMoveNetwork(nn.Module):
 
         # Dynamic inner product with w_quiet
         w_exp = w_quiet.unsqueeze(1)
-        z_quiet = torch.clamp((h * w_exp).sum(dim=-1), -1.0, 1.0)
-        quiet_scores = z_quiet * 32768.0
+        z_raw = torch.clamp((h * w_exp).sum(dim=-1), -1.0, 1.0)
+        score_float = z_raw * 32768.0
+        score_int = torch.clamp(torch.floor((z_raw * 8128.0 * 512.0 + 63.0) / 127.0), -32768.0, 32767.0)
+        quiet_scores = score_float + (score_int - score_float).detach()
+        z_quiet = quiet_scores / 32768.0
         return z_quiet, quiet_scores
 
 
@@ -131,9 +159,11 @@ class CaptureMoveNetwork(nn.Module):
 
         w1 = quantize_ste(self.fc1.weight, self.scale)
         b1 = quantize_bias_ste(self.fc1.bias, self.scale * self.scale)
-        score_out = F.linear(h0, w1, b1).squeeze(-1)
-        z_cap = torch.clamp(score_out, -1.0, 1.0)
-        cap_scores = z_cap * 32768.0
+        score_raw = F.linear(h0, w1, b1).squeeze(-1)
+        score_float = torch.clamp(score_raw, -1.0, 1.0) * 32768.0
+        score_int = torch.clamp(torch.round(score_raw * 4096.0) * 8.0, -32768.0, 32767.0)
+        cap_scores = score_float + (score_int - score_float).detach()
+        z_cap = cap_scores / 32768.0
         return z_cap, cap_scores
 
 
@@ -156,7 +186,9 @@ class LMRMoveNetwork(nn.Module):
 
         w1 = quantize_ste(self.fc1.weight, self.scale)
         b1 = quantize_bias_ste(self.fc1.bias, self.scale * self.scale)
-        r_out = F.linear(h0, w1, b1).squeeze(-1)
+        r_float = F.linear(h0, w1, b1).squeeze(-1)
+        r_int_1024 = torch.floor((r_float * 4096.0 + 2.0) / 4.0)
+        r_out = r_float + (r_int_1024 / 1024.0 - r_float).detach()
         return r_out
 
 
@@ -165,9 +197,9 @@ class DualMiniNN(nn.Module):
     VERSION = 3         # Version 3: Full Architecture (score_quiet, score_capture, evaluate_lmr)
     WEIGHT_SCALE = 64
 
-    def __init__(self):
+    def __init__(self, tau_mp_base=None, tau_lmr_base=None):
         super().__init__()
-        self.node_net = NodeNetwork(in_dim=16, hidden_dim=32, out_dim=26, scale=self.WEIGHT_SCALE)
+        self.node_net = NodeNetwork(in_dim=16, hidden_dim=32, out_dim=26, scale=self.WEIGHT_SCALE, tau_mp_base=tau_mp_base, tau_lmr_base=tau_lmr_base)
         self.quiet_net = QuietMoveNetwork(in_dim=12, hidden_dim=16, scale=self.WEIGHT_SCALE)
         self.cap_net = CaptureMoveNetwork(in_dim=12, hidden_dim=16, scale=self.WEIGHT_SCALE)
         self.lmr_net = LMRMoveNetwork(in_dim=16, hidden_dim=16, scale=self.WEIGHT_SCALE)
