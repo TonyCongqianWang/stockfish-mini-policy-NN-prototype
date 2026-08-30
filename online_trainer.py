@@ -417,33 +417,53 @@ def compute_combined_losses(
     push_up_coef: float = 0.050
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Computes Depth-Independent Residual LMR Loss with Detached MovePicker Scores:
-    - MovePicker: Monty KL divergence + Distributional Shape Loss (Mean & Variance matching on quiets and captures).
-    - Pure Residual LMR: r_total = r_base(depth, rank) + delta_r_NN
-    - Search Physics Invariants:
-        * Move 1 (Top Pick): Always searched at FULL DEPTH (r = 0.00, effort = 1.00).
-        * Late Moves: Physical reduction r_real = clamp(r_base + delta_r_nn, -2.0, depth - 1.0).
-    - LMR Force 1: Monty Search Allocation -log Q(i* | k) with detached MovePicker scores.
-    - LMR Force 2: Ranks 2..4 Individual Log-Effort MSE + Rank 5+ Merged Tail Bucket MSE.
-    - LMR Force 3: Strong Lean Tree Upward Push: push_up_coef * E_late (push_up_coef = 0.050).
+    Computes Direct Physical Search Allocation and Independent Quiet/Capture MovePicker Losses:
+    1. MovePicker:
+       - Quiets: Monty KL divergence + Shape Loss on quiet moves.
+       - Captures: Monty KL divergence + Shape Loss on capture moves.
+    2. Direct Physical Search Allocation:
+       - Move 0: Searched at full depth (Effort = 1.00).
+       - Moves 1..M-1: Searched with late reductions r_real = clamp(r_base + delta_r_nn, -2.0, depth - 1.0).
+       - Target Allocation Q(i*) = E_eff(i*) / sum(E_eff) directly from physical search sequence.
+    3. LMR Profile MSE: Anchored to Master's baseline reduction profile.
+    4. Upward Push on Late Moves: push_up_coef * sum(E_late).
     """
     B, M = z_mp.shape
     i_star = target_p_mp.argmax(dim=-1)
 
-    # Moderate depth weighting
     w_raw = torch.clamp(torch.sqrt(depth.clamp(min=1.0) / 8.0), 0.70, 1.40)
     w_depth = w_raw / w_raw.mean()
 
-    # 1. MovePicker KL + Distributional Shape Loss (Primary Driver)
-    masked_z = z_mp.masked_fill(~legal_mask, -1e4)
-    mp_log_probs = F.log_softmax(masked_z / tau_mp, dim=-1)
-    loss_mp_kl_per_pos = -(target_p_mp * mp_log_probs).sum(dim=-1)
-    loss_mp_kl = (w_depth * loss_mp_kl_per_pos).mean()
+    # 1. MovePicker Quiets & Captures Independent KL
+    quiet_mask = legal_mask & (~is_cap_mask)
+    masked_zq = z_mp.masked_fill(~quiet_mask, -1e4)
+    log_probs_q = F.log_softmax(masked_zq / tau_mp, dim=-1)
+    p_q = target_p_mp * quiet_mask.float()
+    sum_pq = p_q.sum(dim=-1, keepdim=True)
+    p_q_norm = p_q / (sum_pq + 1e-12)
+    has_quiets = (sum_pq.squeeze(-1) > 1e-6)
+
+    loss_mp_kl_q = torch.tensor(0.0, device=z_mp.device)
+    if has_quiets.sum() > 0:
+        loss_q_pos = -(p_q_norm[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1)
+        loss_mp_kl_q = (w_depth[has_quiets] * loss_q_pos).mean()
+
+    cap_mask = legal_mask & is_cap_mask
+    masked_zc = z_mp.masked_fill(~cap_mask, -1e4)
+    log_probs_c = F.log_softmax(masked_zc / tau_mp, dim=-1)
+    p_c = target_p_mp * cap_mask.float()
+    sum_pc = p_c.sum(dim=-1, keepdim=True)
+    p_c_norm = p_c / (sum_pc + 1e-12)
+    has_caps = (sum_pc.squeeze(-1) > 1e-6) & (cap_mask.sum(dim=-1) > 1)
+
+    loss_mp_kl_c = torch.tensor(0.0, device=z_mp.device)
+    if has_caps.sum() > 0:
+        loss_c_pos = -(p_c_norm[has_caps] * log_probs_c[has_caps]).sum(dim=-1)
+        loss_mp_kl_c = (w_depth[has_caps] * loss_c_pos).mean()
+
+    loss_mp_kl = loss_mp_kl_q + 0.5 * loss_mp_kl_c
 
     # Distributional Shape Matching (Mean + Variance for Quiets and Captures)
-    quiet_mask = legal_mask & (~is_cap_mask)
-    cap_mask = legal_mask & is_cap_mask
-
     loss_shape_quiet = torch.tensor(0.0, device=z_mp.device)
     if quiet_mask.sum() > 1:
         z_q_nn = z_mp[quiet_mask]
@@ -459,52 +479,30 @@ def compute_combined_losses(
     loss_mp_shape = loss_shape_quiet + loss_shape_cap
     loss_mp_total = loss_mp_kl + mp_shape_coef * loss_mp_shape
 
-    # 2. Residual Reductions: r_total = r_base + delta_r_nn
+    # 2. Residual Reductions on physical moves
     r_total_nn = r_base + delta_r_nn
     max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
     min_red = torch.tensor(-2.0, device=delta_r_nn.device)
     r_real_nn = torch.minimum(torch.maximum(r_total_nn, min_red), max_red)
     r_real_leg = torch.minimum(torch.maximum(r_legacy, min_red), max_red)
 
-    # 3. LMR Force 1: Move-Order Dependent Search Allocation on Top Monty Move (Detached Scores)
-    scores = z_mp.detach() * 32768.0
-    stage_offset = torch.where(is_cap_mask, 1_000_000.0, 0.0)
-    staged_scores = scores + stage_offset
-    masked_s = staged_scores.masked_fill(~legal_mask, -1e9)
-    s_star = masked_s.gather(1, i_star.unsqueeze(1))
-
-    score_diff = masked_s - s_star
-    soft_rank = torch.sigmoid(score_diff / 1000.0).masked_fill(~legal_mask, 0.0)
-    i_star_mask = F.one_hot(i_star, num_classes=M).bool()
-    soft_rank = soft_rank.masked_fill(i_star_mask, 0.0)
-    k_rank = soft_rank.sum(dim=-1)
-
+    # 3. Direct Physical Search Effort: Move 0 is searched at full depth (effort = 1.0), Moves 1..M-1 are late moves
     masked_r = r_real_nn.masked_fill(~legal_mask, 1e4)
-    E = torch.exp(-masked_r / tau_lmr) * legal_mask.float()
-    S_exp = E.sum(dim=-1, keepdim=True)
+    E_late = torch.exp(-masked_r / tau_lmr) * legal_mask.float()
+    E_eff = E_late.clone()
+    E_eff[:, 0] = 1.0  # Move 1 in physical search is always full depth
 
-    # When i* is Move 1 (k = 0): i* searched at full depth (effort 1.0), late moves searched with reductions
-    D_0 = 1.0 + S_exp - E.gather(1, i_star.unsqueeze(1))
-    Q_k0 = (1.0 / D_0).squeeze(1)
+    D = E_eff.sum(dim=-1, keepdim=True)
+    E_star = E_eff.gather(1, i_star.unsqueeze(1))
+    Q_star = (E_star / (D + 1e-12)).squeeze(1)
+    loss_lmr_order = (w_depth * -torch.log(Q_star + 1e-12)).mean()
 
-    # When i* is late move (k >= 1): Move 1 searched at full depth (1.0), i* searched as late move (E_star)
-    E_star = E.gather(1, i_star.unsqueeze(1)).squeeze(1)
-    D_k = 1.0 + soft_rank.sum(dim=-1, keepdim=True) * E.mean(dim=-1, keepdim=True) + E_star.unsqueeze(1)
-    Q_k = (E_star / D_k.squeeze(1))
-
-    p_first = torch.exp(-k_rank)
-    Q_star = p_first * Q_k0 + (1.0 - p_first) * Q_k
-    loss_lmr_order_per_pos = -torch.log(Q_star + 1e-12)
-    loss_lmr_order = (w_depth * loss_lmr_order_per_pos).mean()
-
-    # 4. LMR Force 2: Rank-Ordered Profile (Ranks 2..4 individual + Rank 5+ Merged Tail Bucket)
+    # 4. Rank Profile MSE (Anchored to Master's baseline reduction profile)
     sorted_r_nn, _ = torch.sort(r_real_nn.masked_fill(~legal_mask, 1e4), dim=-1)
     sorted_r_leg, _ = torch.sort(r_real_leg.masked_fill(~legal_mask, 1e4), dim=-1)
 
     loss_rank_profile = torch.tensor(0.0, device=z_mp.device)
     valid_ranks = 0
-
-    # Individual Ranks 2 to 4 (0-indexed k = 1 to 3)
     for k in range(1, min(M, 4)):
         mask_k = (legal_mask.sum(dim=-1) > k)
         if mask_k.sum() > 0:
@@ -513,11 +511,9 @@ def compute_combined_losses(
             loss_rank_profile = loss_rank_profile + (torch.log(e_nn_k + 1e-6) - torch.log(e_leg_k + 1e-6)).pow(2)
             valid_ranks += 1
 
-    # Merged Tail Bucket: All moves past rank 4 (0-indexed k >= 4, i.e. Moves 5+)
     num_legal = legal_mask.sum(dim=-1, keepdim=True)
     rank_indices = torch.arange(M, device=z_mp.device).unsqueeze(0).expand(B, M)
     tail_mask = (rank_indices >= 4) & (rank_indices < num_legal)
-
     if tail_mask.sum() > 0:
         e_nn_tail = torch.exp(-sorted_r_nn[tail_mask] / tau_lmr).mean()
         e_leg_tail = torch.exp(-sorted_r_leg[tail_mask] / tau_lmr).mean()
@@ -526,14 +522,14 @@ def compute_combined_losses(
 
     loss_rank_profile = loss_rank_profile / max(1, valid_ranks)
 
-    # 5. LMR Force 3: Strong Lean Tree Upward Reduction Pressure on Late Moves
-    effort_nn_late = (E.sum(dim=-1) - E_star)
-    loss_push_up = (w_depth * effort_nn_late).mean()
+    # 5. Upward Push on Late Moves (Moves 1..M-1)
+    effort_late = (E_late[:, 1:]).sum(dim=-1)
+    loss_push_up = (w_depth * effort_late).mean()
 
     loss_lmr_total = lmr_ord_coef * loss_lmr_order + rank_profile_coef * loss_rank_profile + push_up_coef * loss_push_up
     loss_total = loss_mp_total + loss_lmr_total
 
-    mp_top1_acc = (masked_s.argmax(dim=-1) == i_star).float().mean()
+    mp_top1_acc = (i_star == 0).float().mean()
     mean_q_star = Q_star.mean()
 
     return loss_total, loss_mp_kl, loss_mp_shape, loss_lmr_order, loss_rank_profile, loss_push_up, mp_top1_acc, mean_q_star
@@ -553,44 +549,47 @@ def evaluate_handcrafted_master(
             i_star = target_p_mp.argmax(dim=-1)
 
             # Master MovePicker KL
-            masked_z = z_legacy_mp.masked_fill(~legal_mask, -1e4)
-            mp_log_probs = F.log_softmax(masked_z / tau_mp, dim=-1)
-            loss_mp_kl = -(target_p_mp * mp_log_probs).sum(dim=-1).mean()
+            quiet_mask = legal_mask & (~is_cap)
+            masked_zq = z_legacy_mp.masked_fill(~quiet_mask, -1e4)
+            log_probs_q = F.log_softmax(masked_zq / tau_mp, dim=-1)
+            p_q = target_p_mp * quiet_mask.float()
+            sum_pq = p_q.sum(dim=-1, keepdim=True)
+            p_q_norm = p_q / (sum_pq + 1e-12)
+            has_quiets = (sum_pq.squeeze(-1) > 1e-6)
+            loss_mp_kl_q = torch.tensor(0.0, device=z_legacy_mp.device)
+            if has_quiets.sum() > 0:
+                loss_mp_kl_q = -(p_q_norm[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1).mean()
+
+            cap_mask = legal_mask & is_cap
+            masked_zc = z_legacy_mp.masked_fill(~cap_mask, -1e4)
+            log_probs_c = F.log_softmax(masked_zc / tau_mp, dim=-1)
+            p_c = target_p_mp * cap_mask.float()
+            sum_pc = p_c.sum(dim=-1, keepdim=True)
+            p_c_norm = p_c / (sum_pc + 1e-12)
+            has_caps = (sum_pc.squeeze(-1) > 1e-6) & (cap_mask.sum(dim=-1) > 1)
+            loss_mp_kl_c = torch.tensor(0.0, device=z_legacy_mp.device)
+            if has_caps.sum() > 0:
+                loss_mp_kl_c = -(p_c_norm[has_caps] * log_probs_c[has_caps]).sum(dim=-1).mean()
+
+            loss_mp_kl = loss_mp_kl_q + 0.5 * loss_mp_kl_c
 
             # Exact physical reductions
             max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
             min_red = torch.tensor(-2.0, device=r_legacy.device)
             r_real_leg = torch.minimum(torch.maximum(r_legacy, min_red), max_red)
 
-            # Master LMR Move-Order Allocation with Stage Offsets
-            stage_offset = torch.where(is_cap, 1_000_000.0, 0.0)
-            scores = z_legacy_mp * 32768.0 + stage_offset
-            masked_s = scores.masked_fill(~legal_mask, -1e9)
-            s_star = masked_s.gather(1, i_star.unsqueeze(1))
-
-            score_diff = masked_s - s_star
-            soft_rank = torch.sigmoid(score_diff / 1000.0).masked_fill(~legal_mask, 0.0)
-            i_star_mask = F.one_hot(i_star, num_classes=M).bool()
-            soft_rank = soft_rank.masked_fill(i_star_mask, 0.0)
-            k_rank = soft_rank.sum(dim=-1)
-
             masked_r = r_real_leg.masked_fill(~legal_mask, 1e4)
-            E = torch.exp(-masked_r / tau_lmr) * legal_mask.float()
-            S_exp = E.sum(dim=-1, keepdim=True)
+            E_late = torch.exp(-masked_r / tau_lmr) * legal_mask.float()
+            E_eff = E_late.clone()
+            E_eff[:, 0] = 1.0
 
-            D_0 = 1.0 + S_exp - E.gather(1, i_star.unsqueeze(1))
-            Q_k0 = (1.0 / D_0).squeeze(1)
-
-            E_star = E.gather(1, i_star.unsqueeze(1)).squeeze(1)
-            D_k = 1.0 + soft_rank.sum(dim=-1, keepdim=True) * E.mean(dim=-1, keepdim=True) + E_star.unsqueeze(1)
-            Q_k = (E_star / D_k.squeeze(1))
-
-            p_first = torch.exp(-k_rank)
-            Q_star = p_first * Q_k0 + (1.0 - p_first) * Q_k
+            D = E_eff.sum(dim=-1, keepdim=True)
+            E_star = E_eff.gather(1, i_star.unsqueeze(1))
+            Q_star = (E_star / (D + 1e-12)).squeeze(1)
             loss_lmr_order = -(torch.log(Q_star + 1e-12)).mean()
 
-            mp_top1_acc = (masked_s.argmax(dim=-1) == i_star).float().mean()
-            effort_leg_late = (E.sum(dim=-1) - E_star).mean()
+            mp_top1_acc = (i_star == 0).float().mean()
+            effort_leg_late = (E_late[:, 1:]).sum(dim=-1).mean()
             mean_r = r_real_leg[legal_mask].mean()
 
             total_count += B
@@ -657,10 +656,8 @@ def evaluate_validation_rollout(
             r_real_nn = torch.minimum(torch.maximum(r_total_nn, min_red), max_red)
 
             masked_r = r_real_nn.masked_fill(~legal_mask, 1e4)
-            E = torch.exp(-masked_r / tau_lmr) * legal_mask.float()
-            i_star = target_p_mp.argmax(dim=-1)
-            E_star = E.gather(1, i_star.unsqueeze(1)).squeeze(1)
-            actual_effort = (E.sum(dim=-1) - E_star).mean()
+            E_late = torch.exp(-masked_r / tau_lmr) * legal_mask.float()
+            actual_effort = (E_late[:, 1:]).sum(dim=-1).mean()
             mean_r = (r_real_nn * legal_mask.float()).sum() / legal_mask.sum()
 
             actual_effort_sum += actual_effort.item() * B
