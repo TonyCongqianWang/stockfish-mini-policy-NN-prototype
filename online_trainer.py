@@ -414,20 +414,19 @@ def compute_combined_losses(
     depth: torch.Tensor,
     mp_shape_coef: float = 0.20,
     lmr_ord_coef: float = 0.40,
-    rank_profile_coef: float = 0.40,
-    push_up_coef: float = 0.065
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    rank_profile_coef: float = 0.40
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes Direct Physical Search Allocation and Independent Quiet/Capture MovePicker Losses:
     1. MovePicker:
        - Quiets: Monty KL divergence + Shape Loss on quiet moves using z_quiet.
        - Captures: Monty KL divergence + Shape Loss on capture moves using z_cap.
-    2. Direct Physical Search Allocation:
+    2. Direct Physical Search Allocation (Monty Policy-Weighted KL Divergence):
        - Move 0: Searched at full depth (Effort = 1.00).
        - Moves 1..M-1: Searched with late reductions r_real = clamp(r_base + delta_r_nn, -2.0, depth - 1.0).
-       - Target Allocation Q(i*) = E_eff(i*) / sum(E_eff) directly from physical search sequence.
+       - Full Policy Search Effort Distribution Q(j) = E_eff(j) / sum(E_eff).
+       - Loss = -sum_j p_monty(j) * log Q(j).
     3. LMR Profile MSE: Anchored to Master's baseline reduction profile.
-    4. Upward Push on Late Moves: push_up_coef * sum(E_late).
     """
     B, M = z_quiet.shape
     i_star = target_p_mp.argmax(dim=-1)
@@ -495,9 +494,8 @@ def compute_combined_losses(
     E_eff[:, 0] = 1.0  # Move 1 in physical search is always full depth
 
     D = E_eff.sum(dim=-1, keepdim=True)
-    E_star = E_eff.gather(1, i_star.unsqueeze(1))
-    Q_star = (E_star / (D + 1e-12)).squeeze(1)
-    loss_lmr_order = (w_depth * -torch.log(Q_star + 1e-12)).mean()
+    Q_dist = E_eff / (D + 1e-12)
+    loss_lmr_order = (w_depth * -(target_p_mp * torch.log(Q_dist + 1e-12)).sum(dim=-1)).mean()
 
     # 5. Rank Profile MSE (Anchored to Master's baseline reduction profile)
     sorted_r_nn, _ = torch.sort(r_real_nn.masked_fill(~legal_mask, 1e4), dim=-1)
@@ -524,17 +522,11 @@ def compute_combined_losses(
 
     loss_rank_profile = loss_rank_profile / max(1, valid_ranks)
 
-    # 6. Upward Push on Late Moves (Moves 1..M-1): Scaled by theoretical capacity log(1 + j) / log(1 + M)
-    j_ranks = torch.arange(1, M, device=delta_r_nn.device, dtype=torch.float32).unsqueeze(0)
-    push_weight = torch.log(1.0 + j_ranks) / math.log(1.0 + M)
-    effort_late = (E_late[:, 1:] * push_weight).sum(dim=-1)
-    loss_push_up = (w_depth * effort_late).mean()
-
-    loss_lmr_total = lmr_ord_coef * loss_lmr_order + rank_profile_coef * loss_rank_profile + push_up_coef * loss_push_up
+    loss_lmr_total = lmr_ord_coef * loss_lmr_order + rank_profile_coef * loss_rank_profile
     loss_total = loss_mp_total + loss_lmr_total
-    mean_q_star = Q_star.mean()
+    mean_q_star = Q_dist.gather(1, i_star.unsqueeze(1)).squeeze(1).mean()
 
-    return loss_total, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_order, loss_rank_profile, loss_push_up, acc_q, acc_c, mean_q_star
+    return loss_total, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_order, loss_rank_profile, acc_q, acc_c, mean_q_star
 
 
 def evaluate_handcrafted_master(
@@ -588,10 +580,10 @@ def evaluate_handcrafted_master(
             E_eff[:, 0] = 1.0
 
             D = E_eff.sum(dim=-1, keepdim=True)
-            E_star = E_eff.gather(1, i_star.unsqueeze(1))
-            Q_star = (E_star / (D + 1e-12)).squeeze(1)
-            loss_lmr_order = -(torch.log(Q_star + 1e-12)).mean()
+            Q_dist = E_eff / (D + 1e-12)
+            loss_lmr_order = -(target_p_mp * torch.log(Q_dist + 1e-12)).sum(dim=-1).mean()
 
+            Q_star = Q_dist.gather(1, i_star.unsqueeze(1)).squeeze(1)
             effort_leg_late = (E_late[:, 1:]).sum(dim=-1).mean()
             mean_r = r_real_leg[legal_mask].mean()
 
@@ -625,12 +617,11 @@ def evaluate_validation_rollout(
     mp_anchor_coef: float = 0.20,
     lmr_ord_coef: float = 0.40,
     rank_profile_coef: float = 0.40,
-    push_up_coef: float = 0.065,
     tau_lmr: float = 0.8658
 ) -> Dict[str, float]:
     model.eval()
     tot_loss_sum, mp_kl_q_sum, mp_kl_c_sum, mp_anc_sum, lmr_ord_sum = 0.0, 0.0, 0.0, 0.0, 0.0
-    rank_prof_loss_sum, push_loss_sum = 0.0, 0.0
+    rank_prof_loss_sum = 0.0
     quiet_top1_sum, cap_top1_sum, q_star_sum = 0.0, 0.0, 0.0
     actual_effort_sum, actual_r_sum, total_count = 0.0, 0.0, 0
 
@@ -641,9 +632,9 @@ def evaluate_validation_rollout(
             z_quiet = quiet_scores / 32768.0
             z_cap = cap_scores / 32768.0
 
-            loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, loss_push, acc_q, acc_c, mean_q_star = compute_combined_losses(
+            loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, acc_q, acc_c, mean_q_star = compute_combined_losses(
                 z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
-                mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
+                mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
             )
 
             B = u_node.size(0)
@@ -654,7 +645,6 @@ def evaluate_validation_rollout(
             mp_anc_sum += loss_mp_shape.item() * B
             lmr_ord_sum += loss_lmr_ord.item() * B
             rank_prof_loss_sum += loss_rank_prof.item() * B
-            push_loss_sum += loss_push.item() * B
             quiet_top1_sum += acc_q.item() * B
             cap_top1_sum += acc_c.item() * B
             q_star_sum += mean_q_star.item() * B
@@ -682,7 +672,6 @@ def evaluate_validation_rollout(
         "mp_anchor_loss": mp_anc_sum / n,
         "lmr_order_loss": lmr_ord_sum / n,
         "rank_profile_loss": rank_prof_loss_sum / n,
-        "push_loss": push_loss_sum / n,
         "mp_quiet_top1": (quiet_top1_sum / n) * 100.0,
         "mp_cap_top1": (cap_top1_sum / n) * 100.0,
         "mean_q_search_star": (q_star_sum / n) * 100.0,
@@ -1012,74 +1001,79 @@ def run_heldout_online_evaluation(
         temp_model_path = f"/tmp/online_test_{session_tag}.miniNN"
         model.export_quantized_binary(temp_model_path)
 
-    tel_path = os.path.join(CACHE_DIR, f"heldout_tel_{session_tag}.jsonl")
-    db_path = os.path.join(CACHE_DIR, f"heldout_monty_{session_tag}.db")
-    if os.path.exists(tel_path):
-        os.remove(tel_path)
+    if model is None:
+        tel_path = os.path.join(CACHE_DIR, "master_heldout_shared_v3.jsonl")
+        db_path = os.path.join(CACHE_DIR, "master_heldout_shared_v3.db")
+    else:
+        tel_path = os.path.join(CACHE_DIR, f"heldout_tel_{session_tag}.jsonl")
+        db_path = os.path.join(CACHE_DIR, f"heldout_monty_{session_tag}.db")
+        if os.path.exists(tel_path):
+            os.remove(tel_path)
 
-    # 1. Rollout C++ Stockfish searches on heldout test FENs
-    samples_per_fen = max(1, math.ceil(target_samples / len(test_fens)))
-    sample_interval = max(500, nodes_per_fen // samples_per_fen)
+    # 1. Rollout C++ Stockfish searches on heldout test FENs (cached for Master)
+    if not (model is None and os.path.exists(tel_path) and os.path.getsize(tel_path) > 0 and os.path.exists(db_path)):
+        samples_per_fen = max(1, math.ceil(target_samples / len(test_fens)))
+        sample_interval = max(500, nodes_per_fen // samples_per_fen)
 
-    chunk_size = math.ceil(len(test_fens) / workers)
-    chunks = [test_fens[i : i + chunk_size] for i in range(0, len(test_fens), chunk_size)]
-    worker_tel_paths = [os.path.join(CACHE_DIR, f"heldout_tel_w{w_id}_{session_tag}.jsonl") for w_id in range(len(chunks))]
-
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, sample_interval, temp_model_path, worker_tel_paths[w_id])
-            for w_id, chunk in enumerate(chunks)
-        ]
-        for f in as_completed(futures):
-            f.result()
-
-    all_lines = []
-    for p in worker_tel_paths:
-        if os.path.exists(p):
-            with open(p, "r") as in_f:
-                for line in in_f:
-                    if line.strip():
-                        all_lines.append(line)
-            os.remove(p)
-
-    with open(tel_path, "w") as out_f:
-        for line in all_lines:
-            out_f.write(line)
-
-    # 2. Extract unique FENs from tel_path and query Monty on them
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("CREATE TABLE IF NOT EXISTS policies (fen TEXT PRIMARY KEY, policy_json TEXT)")
-    conn.commit()
-    conn.close()
-
-    fens_in_tel = set()
-    if os.path.exists(tel_path):
-        with open(tel_path, "r") as f:
-            for line in f:
-                if line.strip():
-                    try:
-                        f_str = json.loads(line.strip()).get("fen")
-                        if f_str:
-                            fens_in_tel.add(f_str)
-                    except Exception:
-                        pass
-
-    fens_to_query = list(fens_in_tel)
-    if fens_to_query:
-        m_chunk_size = math.ceil(len(fens_to_query) / workers)
-        m_chunks = [fens_to_query[i : i + m_chunk_size] for i in range(0, len(fens_to_query), m_chunk_size)]
-        worker_db_paths = [os.path.join(CACHE_DIR, f"heldout_m_w{w_id}_{session_tag}.db") for w_id in range(len(m_chunks))]
+        chunk_size = math.ceil(len(test_fens) / workers)
+        chunks = [test_fens[i : i + chunk_size] for i in range(0, len(test_fens), chunk_size)]
+        worker_tel_paths = [os.path.join(CACHE_DIR, f"heldout_tel_w{w_id}_{session_tag}.jsonl") for w_id in range(len(chunks))]
 
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = [
-                executor.submit(query_monty_worker, w_id, m_chunk, worker_db_paths[w_id])
-                for w_id, m_chunk in enumerate(m_chunks)
+                executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, sample_interval, temp_model_path, worker_tel_paths[w_id])
+                for w_id, chunk in enumerate(chunks)
             ]
             for f in as_completed(futures):
                 f.result()
 
-        merge_worker_dbs(db_path, worker_db_paths)
+        all_lines = []
+        for p in worker_tel_paths:
+            if os.path.exists(p):
+                with open(p, "r") as in_f:
+                    for line in in_f:
+                        if line.strip():
+                            all_lines.append(line)
+                os.remove(p)
+
+        with open(tel_path, "w") as out_f:
+            for line in all_lines:
+                out_f.write(line)
+
+        # 2. Extract unique FENs from tel_path and query Monty on them
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("CREATE TABLE IF NOT EXISTS policies (fen TEXT PRIMARY KEY, policy_json TEXT)")
+        conn.commit()
+        conn.close()
+
+        fens_in_tel = set()
+        if os.path.exists(tel_path):
+            with open(tel_path, "r") as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            f_str = json.loads(line.strip()).get("fen")
+                            if f_str:
+                                fens_in_tel.add(f_str)
+                        except Exception:
+                            pass
+
+        fens_to_query = list(fens_in_tel)
+        if fens_to_query:
+            m_chunk_size = math.ceil(len(fens_to_query) / workers)
+            m_chunks = [fens_to_query[i : i + m_chunk_size] for i in range(0, len(fens_to_query), m_chunk_size)]
+            worker_db_paths = [os.path.join(CACHE_DIR, f"heldout_m_w{w_id}_{session_tag}.db") for w_id in range(len(m_chunks))]
+
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(query_monty_worker, w_id, m_chunk, worker_db_paths[w_id])
+                    for w_id, m_chunk in enumerate(m_chunks)
+                ]
+                for f in as_completed(futures):
+                    f.result()
+
+            merge_worker_dbs(db_path, worker_db_paths)
 
     # 3. Compute On-Policy Physical Move 1 match vs Monty Oracle
     conn = sqlite3.connect(db_path)
@@ -1206,7 +1200,6 @@ def train_single_run(
     mp_anchor_coef: float,
     lmr_ord_coef: float,
     rank_profile_coef: float,
-    push_up_coef: float,
     args,
     val_loader: DataLoader,
     val_dataset: RolloutDataset,
@@ -1228,9 +1221,8 @@ def train_single_run(
     print(f"Mini-Batch Size:            {args.minibatch_size}", flush=True)
     print(f"PPO Multi-Epochs / Iter:    {args.ppo_epochs}", flush=True)
     print(f"MovePicker Anchor Coef:     {mp_anchor_coef:.2f}", flush=True)
-    print(f"LMR Order Coef (Detached):  {lmr_ord_coef:.2f}", flush=True)
+    print(f"LMR Policy KL Coef:         {lmr_ord_coef:.2f}", flush=True)
     print(f"Rank-Profile MSE Coef:      {rank_profile_coef:.2f}", flush=True)
-    print(f"Lean Tree Upward Push Coef: {push_up_coef:.4f}", flush=True)
     print(f"Output Binary:              {output_path}", flush=True)
     print("=" * 80, flush=True)
 
@@ -1289,9 +1281,9 @@ def train_single_run(
                 z_quiet = quiet_scores / 32768.0
                 z_cap = cap_scores / 32768.0
 
-                loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, loss_push, _, _, _ = compute_combined_losses(
+                loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, _, _, _ = compute_combined_losses(
                     z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
-                    mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
+                    mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
                 )
 
                 loss.backward()
@@ -1324,18 +1316,18 @@ def train_single_run(
         if iteration % args.val_freq == 0 or iteration == 1 or iteration == args.iterations:
             val_stats = evaluate_validation_rollout(
                 model, val_loader,
-                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
+                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
             )
             print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
-                  f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Ord: {iter_lmr_ord/n_steps:.3f}) | "
+                  f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Pol: {iter_lmr_ord/n_steps:.3f}) | "
                   f"Val MP: (Q:{val_stats['mp_quiet_top1']:5.2f}%, C:{val_stats['mp_cap_top1']:5.2f}%) | Val Alloc Q(i*): {val_stats['mean_q_search_star']:5.2f}% | Effort: {val_stats['mean_search_effort']:.3f} | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
         else:
             print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
-                  f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Ord: {iter_lmr_ord/n_steps:.3f})", flush=True)
+                  f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Pol: {iter_lmr_ord/n_steps:.3f})", flush=True)
 
     final_stats = evaluate_validation_rollout(
         model, val_loader,
-        mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
+        mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
     )
     model.export_quantized_binary(output_path)
 
@@ -1350,7 +1342,7 @@ def train_single_run(
             target_samples=args.val_samples,
             nodes_per_fen=args.nodes,
             workers=args.workers,
-            session_tag=f"{run_name}_heldout"
+            session_tag=f"{run_name}_heldout_eval"
         )
         final_stats.update(heldout_stats)
 
@@ -1358,34 +1350,34 @@ def train_single_run(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="On-Policy Dual Mini-NN Closed-Loop Trainer & Grid Runner.")
-    parser.add_argument("--iterations", type=int, default=128, help="Total outer iterations per run (default: 128)")
-    parser.add_argument("--rollout-samples", type=int, default=512, help="Fresh on-policy rollout buffer size per iteration (default: 512)")
-    parser.add_argument("--minibatch-size", type=int, default=64, help="Minibatch size for SGD updates (default: 64)")
-    parser.add_argument("--ppo-epochs", type=int, default=4, help="PPO multi-epoch passes over fresh rollout buffer (default: 4)")
-    parser.add_argument("--sync-interval", type=int, default=4, help="Gradient steps between model syncs (default: 4)")
-    parser.add_argument("--val-freq", type=int, default=8, help="Validation frequency (default: 8)")
-    parser.add_argument("--val-samples", type=int, default=32768, help="Fixed validation rollout samples (default: 32768 = 2^15)")
-    parser.add_argument("--stream-limit", type=int, default=500000, help="Stream limit for FEN subsampling (default: 500,000)")
-    parser.add_argument("--train-fens-pool", type=int, default=100000, help="Training FEN pool (default: 100,000)")
-    parser.add_argument("--val-fens-pool", type=int, default=1000, help="Validation FEN pool (default: 1,000)")
-    parser.add_argument("--test-fens-pool", type=int, default=1000, help="Held-out Test FEN pool (default: 1,000)")
-    parser.add_argument("--nodes", type=int, default=500_000, help="Search budget per FEN (default: 500,000)")
-    parser.add_argument("--sample-interval", type=int, default=10_000, help="Subsample interval (default: 10,000)")
-    parser.add_argument("--workers", type=int, default=6, help="Parallel worker threads (default: 6)")
-    parser.add_argument("--grid", action="store_true", help="Run the 3-experiment hyperparameter grid")
-    parser.add_argument("--lr", type=float, default=4e-3, help="Peak learning rate (default: 4e-3)")
-    parser.add_argument("--mp-anchor-coef", type=float, default=0.20, help="MovePicker anchor weight (default: 0.20)")
-    parser.add_argument("--lmr-ord-coef", type=float, default=0.40, help="LMR order loss weight with detached scores (default: 0.40)")
-    parser.add_argument("--rank-profile-coef", type=float, default=0.40, help="Rank profile MSE loss weight (default: 0.40)")
-    parser.add_argument("--push-up-coef", type=float, default=0.065, help="Lean tree upward push weight (default: 0.065)")
-    parser.add_argument("--output", type=str, default="floored_dual_64it.miniNN", help="Output model binary path")
-
+    parser = argparse.ArgumentParser(description="Closed-Loop On-Policy Mini-NN Dual Policy & LMR Trainer (Version 3)")
+    parser.add_argument("--iterations", type=int, default=8, help="Number of on-policy rollout iterations (default: 8)")
+    parser.add_argument("--rollout-samples", type=int, default=16384, help="Transitions per online rollout buffer (default: 16384)")
+    parser.add_argument("--val-samples", type=int, default=32768, help="Validation set fixed rollout samples (default: 32768)")
+    parser.add_argument("--stream-limit", type=int, default=500000, help="Initial stream limit of unique FENs (default: 500,000)")
+    parser.add_argument("--val-fens-pool", type=int, default=5000, help="Number of FENs dedicated to validation set (default: 5,000)")
+    parser.add_argument("--test-fens-pool", type=int, default=1000, help="Number of FENs dedicated to unseen test set (default: 1,000)")
+    parser.add_argument("--train-fens-pool", type=int, default=100000, help="Number of FENs dedicated to training rollouts (default: 100,000)")
+    parser.add_argument("--val-freq", type=int, default=1, help="Validation evaluation frequency in iterations (default: 1)")
+    parser.add_argument("--lr", type=float, default=4e-3, help="Learning rate with warmup-cosine schedule (default: 4e-3)")
+    parser.add_argument("--minibatch-size", type=int, default=256, help="Mini-batch size for SGD (default: 256)")
+    parser.add_argument("--ppo-epochs", type=int, default=4, help="PPO-style multi-epoch updates per iteration (default: 4)")
+    parser.add_argument("--mp-anchor-coef", type=float, default=0.20, help="MovePicker shape anchor regularization weight (default: 0.20)")
+    parser.add_argument("--lmr-ord-coef", type=float, default=0.40, help="LMR policy cross-entropy weight (default: 0.40)")
+    parser.add_argument("--rank-profile-coef", type=float, default=0.40, help="LMR baseline rank profile anchor weight (default: 0.40)")
+    parser.add_argument("--nodes", type=int, default=15000, help="Stockfish nodes per FEN search (default: 15,000)")
+    parser.add_argument("--sample-interval", type=int, default=3000, help="C++ telemetry node sampling interval (default: 3,000)")
+    parser.add_argument("--sync-interval", type=int, default=16, help="Frequency of updating C++ weights in gradient steps (default: 16)")
+    parser.add_argument("--workers", type=int, default=12, help="Number of parallel C++ Stockfish workers (default: 12)")
+    parser.add_argument("--output", type=str, default="floored_dual_policy_run1.miniNN", help="Path to save trained quantized model")
+    parser.add_argument("--grid", action="store_true", help="Run comparative benchmark experiments")
     args = parser.parse_args()
-    t_lmr, t_mp, floor_lmr, floor_mp = load_calibration_parameters()
+
+    t_lmr, floor_lmr = 0.8658, 0.010
+    t_mp, floor_mp = 0.1154, 0.010
 
     print("=" * 80, flush=True)
-    print("   ON-POLICY CLOSED-LOOP DUAL MINI-NN TRAINER (RESIDUAL ARCHITECTURE - 6.5E-2 PUSH)", flush=True)
+    print("   ON-POLICY CLOSED-LOOP DUAL MINI-NN TRAINER (FULL POLICY SEARCH ALLOCATION)", flush=True)
     print("=" * 80, flush=True)
     print(f"Total Iterations:            {args.iterations:,}", flush=True)
     print(f"Validation Frequency:        Every {args.val_freq} iterations", flush=True)
@@ -1448,7 +1440,7 @@ def main():
     print(f"{'Mean Reduction (Plies)':<40} | {master_stats['master_mean_reduction']:<25.4f}", flush=True)
     print("=" * 80 + "\n", flush=True)
 
-    # Master Baseline On-Policy Heldout Evaluation
+    # Master Baseline On-Policy Heldout Evaluation (Cached)
     master_heldout_stats = {}
     if test_fens_pool:
         master_heldout_stats = run_heldout_online_evaluation(
@@ -1464,13 +1456,20 @@ def main():
     if args.grid:
         grid_configs = [
             {
-                "name": "Run1_Residual_LMR40_Push6e2",
+                "name": "Run1_PolicyLMR_LR4e3",
                 "lr": 4e-3,
                 "mp_anchor": 0.20,
                 "lmr_ord": 0.40,
                 "rank_profile": 0.40,
-                "push_up": 0.065,
-                "output": "floored_dual_push6e2_run1.miniNN"
+                "output": "floored_dual_policy_lr4e3.miniNN"
+            },
+            {
+                "name": "Run2_PolicyLMR_LR2e3",
+                "lr": 2e-3,
+                "mp_anchor": 0.20,
+                "lmr_ord": 0.40,
+                "rank_profile": 0.40,
+                "output": "floored_dual_policy_lr2e3.miniNN"
             },
         ]
 
@@ -1482,7 +1481,6 @@ def main():
                 mp_anchor_coef=cfg["mp_anchor"],
                 lmr_ord_coef=cfg["lmr_ord"],
                 rank_profile_coef=cfg["rank_profile"],
-                push_up_coef=cfg["push_up"],
                 args=args,
                 val_loader=val_loader,
                 val_dataset=val_dataset,
@@ -1524,12 +1522,11 @@ def main():
 
     else:
         final_stats = train_single_run(
-            run_name="Single_Push6e2_Run",
+            run_name="Single_PolicyLMR_Run",
             lr=args.lr,
             mp_anchor_coef=args.mp_anchor_coef,
             lmr_ord_coef=args.lmr_ord_coef,
             rank_profile_coef=args.rank_profile_coef,
-            push_up_coef=args.push_up_coef,
             args=args,
             val_loader=val_loader,
             val_dataset=val_dataset,
@@ -1550,7 +1547,7 @@ def main():
         print(f"{'MovePicker Top-1 Monty Match':<40} | {final_stats['mp_top1_acc']:<24.2f}% | {master_stats['master_mp_top1']:<24.2f}%", flush=True)
         print(f"{'MovePicker KL Divergence Loss':<40} | {final_stats['mp_kl_loss']:<25.4f} | {master_stats['master_mp_kl']:<25.4f}", flush=True)
         print(f"{'Mean Top Move Search Allocation Q(i*)':<40} | {final_stats['mean_q_search_star']:<24.2f}% | {master_stats['master_q_search_star']:<24.2f}%", flush=True)
-        print(f"{'LMR Move-Order Dependent Loss':<40} | {final_stats['lmr_order_loss']:<25.4f} | {master_stats['master_lmr_ord']:<25.4f}", flush=True)
+        print(f"{'LMR Policy-Weighted Loss':<40} | {final_stats['lmr_order_loss']:<25.4f} | {master_stats['master_lmr_ord']:<25.4f}", flush=True)
         print(f"{'Mean Late-Move Search Effort':<40} | {final_stats['mean_search_effort']:<25.4f} | {master_stats['master_mean_effort']:<25.4f}", flush=True)
         print(f"{'Mean Reduction (Plies)':<40} | {final_stats['mean_reduction']:<25.4f} | {master_stats['master_mean_reduction']:<25.4f}", flush=True)
         print("=" * 100, flush=True)
