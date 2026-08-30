@@ -530,11 +530,9 @@ def compute_combined_losses(
 
     loss_lmr_total = lmr_ord_coef * loss_lmr_order + rank_profile_coef * loss_rank_profile + push_up_coef * loss_push_up
     loss_total = loss_mp_total + loss_lmr_total
-
-    mp_top1_acc = (i_star == 0).float().mean()
     mean_q_star = Q_star.mean()
 
-    return loss_total, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_order, loss_rank_profile, loss_push_up, mp_top1_acc, acc_q, acc_c, mean_q_star
+    return loss_total, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_order, loss_rank_profile, loss_push_up, acc_q, acc_c, mean_q_star
 
 
 def evaluate_handcrafted_master(
@@ -543,7 +541,7 @@ def evaluate_handcrafted_master(
     tau_lmr: float = 0.8658
 ) -> Dict[str, float]:
     mp_kl_q_sum, mp_kl_c_sum, lmr_ord_sum = 0.0, 0.0, 0.0
-    mp_top1_sum, quiet_top1_sum, cap_top1_sum, q_star_sum = 0.0, 0.0, 0.0, 0.0
+    quiet_top1_sum, cap_top1_sum, q_star_sum = 0.0, 0.0, 0.0
     total_count, tot_effort_sum, mean_r_sum = 0, 0.0, 0.0
 
     with torch.no_grad():
@@ -592,7 +590,6 @@ def evaluate_handcrafted_master(
             Q_star = (E_star / (D + 1e-12)).squeeze(1)
             loss_lmr_order = -(torch.log(Q_star + 1e-12)).mean()
 
-            mp_top1_acc = (i_star == 0).float().mean()
             effort_leg_late = (E_late[:, 1:]).sum(dim=-1).mean()
             mean_r = r_real_leg[legal_mask].mean()
 
@@ -600,7 +597,6 @@ def evaluate_handcrafted_master(
             mp_kl_q_sum += loss_mp_kl_q.item() * B
             mp_kl_c_sum += loss_mp_kl_c.item() * B
             lmr_ord_sum += loss_lmr_order.item() * B
-            mp_top1_sum += mp_top1_acc.item() * B
             quiet_top1_sum += acc_q.item() * B
             cap_top1_sum += acc_c.item() * B
             q_star_sum += Q_star.mean().item() * B
@@ -609,7 +605,6 @@ def evaluate_handcrafted_master(
 
     n = max(1, total_count)
     return {
-        "master_mp_top1": (mp_top1_sum / n) * 100.0,
         "master_quiet_top1": (quiet_top1_sum / n) * 100.0,
         "master_cap_top1": (cap_top1_sum / n) * 100.0,
         "master_mp_kl_q": mp_kl_q_sum / n,
@@ -634,7 +629,7 @@ def evaluate_validation_rollout(
     model.eval()
     tot_loss_sum, mp_kl_q_sum, mp_kl_c_sum, mp_anc_sum, lmr_ord_sum = 0.0, 0.0, 0.0, 0.0, 0.0
     rank_prof_loss_sum, push_loss_sum = 0.0, 0.0
-    mp_top1_sum, quiet_top1_sum, cap_top1_sum, q_star_sum = 0.0, 0.0, 0.0, 0.0
+    quiet_top1_sum, cap_top1_sum, q_star_sum = 0.0, 0.0, 0.0
     actual_effort_sum, actual_r_sum, total_count = 0.0, 0.0, 0
 
     with torch.no_grad():
@@ -644,7 +639,7 @@ def evaluate_validation_rollout(
             z_quiet = quiet_scores / 32768.0
             z_cap = cap_scores / 32768.0
 
-            loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, loss_push, mp_top1_acc, acc_q, acc_c, mean_q_star = compute_combined_losses(
+            loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, loss_push, acc_q, acc_c, mean_q_star = compute_combined_losses(
                 z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
                 mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
             )
@@ -658,7 +653,6 @@ def evaluate_validation_rollout(
             lmr_ord_sum += loss_lmr_ord.item() * B
             rank_prof_loss_sum += loss_rank_prof.item() * B
             push_loss_sum += loss_push.item() * B
-            mp_top1_sum += mp_top1_acc.item() * B
             quiet_top1_sum += acc_q.item() * B
             cap_top1_sum += acc_c.item() * B
             q_star_sum += mean_q_star.item() * B
@@ -687,7 +681,6 @@ def evaluate_validation_rollout(
         "lmr_order_loss": lmr_ord_sum / n,
         "rank_profile_loss": rank_prof_loss_sum / n,
         "push_loss": push_loss_sum / n,
-        "mp_top1_acc": (mp_top1_sum / n) * 100.0,
         "mp_quiet_top1": (quiet_top1_sum / n) * 100.0,
         "mp_cap_top1": (cap_top1_sum / n) * 100.0,
         "mean_q_search_star": (q_star_sum / n) * 100.0,
@@ -1270,7 +1263,7 @@ def train_single_run(
                 z_quiet = quiet_scores / 32768.0
                 z_cap = cap_scores / 32768.0
 
-                loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, loss_push, _, _, _, _ = compute_combined_losses(
+                loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, loss_push, _, _, _ = compute_combined_losses(
                     z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
                     mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
                 )
@@ -1309,7 +1302,7 @@ def train_single_run(
             )
             print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
                   f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Ord: {iter_lmr_ord/n_steps:.3f}) | "
-                  f"Val MP Top-1: {val_stats['mp_top1_acc']:5.2f}% (Q:{val_stats['mp_quiet_top1']:5.2f}%, C:{val_stats['mp_cap_top1']:5.2f}%) | Val Search Alloc Q(i*): {val_stats['mean_q_search_star']:5.2f}% | Effort: {val_stats['mean_search_effort']:.3f} | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
+                  f"Val MP: (Q:{val_stats['mp_quiet_top1']:5.2f}%, C:{val_stats['mp_cap_top1']:5.2f}%) | Val Alloc Q(i*): {val_stats['mean_q_search_star']:5.2f}% | Effort: {val_stats['mean_search_effort']:.3f} | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
         else:
             print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
                   f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Ord: {iter_lmr_ord/n_steps:.3f})", flush=True)
@@ -1419,9 +1412,8 @@ def main():
     master_stats = evaluate_handcrafted_master(val_loader, tau_mp=t_mp, tau_lmr=t_lmr)
     print(f"{'Metric':<40} | {'Handcrafted Stockfish Master':<25}", flush=True)
     print("-" * 80, flush=True)
-    print(f"{'MovePicker Top-1 Monty Match':<40} | {master_stats['master_mp_top1']:<24.2f}%", flush=True)
-    print(f"{'  - Quiet Moves Top-1 Match':<40} | {master_stats['master_quiet_top1']:<24.2f}%", flush=True)
-    print(f"{'  - Capture Moves Top-1 Match':<40} | {master_stats['master_cap_top1']:<24.2f}%", flush=True)
+    print(f"{'Quiet Moves Top-1 Match (within quiets)':<40} | {master_stats['master_quiet_top1']:<24.2f}%", flush=True)
+    print(f"{'Capture Moves Top-1 Match (within caps)':<40} | {master_stats['master_cap_top1']:<24.2f}%", flush=True)
     print(f"{'MovePicker Quiet KL Divergence':<40} | {master_stats['master_mp_kl_q']:<25.4f}", flush=True)
     print(f"{'MovePicker Capture KL Divergence':<40} | {master_stats['master_mp_kl_c']:<25.4f}", flush=True)
     print(f"{'Mean Top Move Search Allocation Q(i*)':<40} | {master_stats['master_q_search_star']:<24.2f}%", flush=True)
