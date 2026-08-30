@@ -524,8 +524,10 @@ def compute_combined_losses(
 
     loss_rank_profile = loss_rank_profile / max(1, valid_ranks)
 
-    # 6. Upward Push on Late Moves (Moves 1..M-1)
-    effort_late = (E_late[:, 1:]).sum(dim=-1)
+    # 6. Upward Push on Late Moves (Moves 1..M-1): Scaled by theoretical capacity log(1 + j) / log(1 + M)
+    j_ranks = torch.arange(1, M, device=delta_r_nn.device, dtype=torch.float32).unsqueeze(0)
+    push_weight = torch.log(1.0 + j_ranks) / math.log(1.0 + M)
+    effort_late = (E_late[:, 1:] * push_weight).sum(dim=-1)
     loss_push_up = (w_depth * effort_late).mean()
 
     loss_lmr_total = lmr_ord_coef * loss_lmr_order + rank_profile_coef * loss_rank_profile + push_up_coef * loss_push_up
@@ -1089,6 +1091,8 @@ def run_heldout_online_evaluation(
 
     total_positions = 0
     top1_matches = 0
+    quiet1_matches, total_quiet_pos = 0, 0
+    cap1_matches, total_cap_pos = 0, 0
     cpp1_in_m3_matches = 0
     m1_in_cpp3_matches = 0
     monty_top1_red_sum = 0.0
@@ -1124,6 +1128,22 @@ def run_heldout_online_evaluation(
                     if top_monty_move in top3_cpp_moves:
                         m1_in_cpp3_matches += 1
 
+                    # Quiet moves on-policy match
+                    quiets = [m for m in moves if not m.get("is_capture", False)]
+                    monty_quiets = [m for m in sorted_monty if any(qm["move"] == m for qm in quiets)]
+                    if len(quiets) >= 2 and monty_quiets and sum(m_poly.get(m, 0.0) for m in monty_quiets) >= 0.05:
+                        total_quiet_pos += 1
+                        if quiets[0]["move"] == monty_quiets[0]:
+                            quiet1_matches += 1
+
+                    # Capture moves on-policy match
+                    caps = [m for m in moves if m.get("is_capture", False)]
+                    monty_caps = [m for m in sorted_monty if any(cm["move"] == m for cm in caps)]
+                    if len(caps) >= 2 and monty_caps and sum(m_poly.get(m, 0.0) for m in monty_caps) >= 0.05:
+                        total_cap_pos += 1
+                        if caps[0]["move"] == monty_caps[0]:
+                            cap1_matches += 1
+
                     depth_val = s.get("depth", 8)
                     for m_idx, m_info in enumerate(moves):
                         rank_val = m_info.get("picker_rank", m_idx + 1)
@@ -1148,6 +1168,8 @@ def run_heldout_online_evaluation(
                 total_positions += 1
 
     top1_pct = (top1_matches / max(1, total_positions)) * 100.0
+    quiet1_pct = (quiet1_matches / max(1, total_quiet_pos)) * 100.0
+    cap1_pct = (cap1_matches / max(1, total_cap_pos)) * 100.0
     cpp1_in_m3_pct = (cpp1_in_m3_matches / max(1, total_positions)) * 100.0
     m1_in_cpp3_pct = (m1_in_cpp3_matches / max(1, total_positions)) * 100.0
     mean_top1_r = monty_top1_red_sum / max(1, monty_top1_count)
@@ -1155,6 +1177,8 @@ def run_heldout_online_evaluation(
 
     print(f"Heldout Positions Evaluated:                {total_positions:,}", flush=True)
     print(f"Physical C++ Move 1 == Monty Top-1 Match:   {top1_pct:.2f}%", flush=True)
+    print(f"  - Physical C++ Quiet 1 Match (within Q):  {quiet1_pct:.2f}%", flush=True)
+    print(f"  - Physical C++ Capture 1 Match (within C):{cap1_pct:.2f}%", flush=True)
     print(f"Physical C++ Move 1 in Monty Top-3 Match:   {cpp1_in_m3_pct:.2f}%", flush=True)
     print(f"Monty Top-1 in Physical C++ Top-3 Match:   {m1_in_cpp3_pct:.2f}% (Dual)", flush=True)
     print(f"Mean LMR Reduction on Monty Top-1 Move:     {mean_top1_r:.2f} plies", flush=True)
@@ -1166,6 +1190,8 @@ def run_heldout_online_evaluation(
 
     return {
         "heldout_top1_match": top1_pct,
+        "heldout_quiet1_match": quiet1_pct,
+        "heldout_cap1_match": cap1_pct,
         "heldout_cpp1_in_m3_match": cpp1_in_m3_pct,
         "heldout_m1_in_cpp3_match": m1_in_cpp3_pct,
         "heldout_top1_reduction": mean_top1_r,
@@ -1470,27 +1496,31 @@ def main():
             )
             results[cfg["name"]] = stats
 
-        print("\n" + "=" * 148, flush=True)
-        print("                                       FINAL COMPARATIVE BENCHMARK TABLE (GRID EXPERIMENTS)", flush=True)
-        print("=" * 148, flush=True)
-        header = f"{'Configuration':<30} | {'Heldout Top-1':<13} | {'CPP 1 in M3':<12} | {'M1 in CPP 3':<12} | {'Top-1 Red':<10} | {'Late Red':<10} | {'Val Effort E':<12} | {'Val Mean Red':<12}"
+        print("\n" + "=" * 168, flush=True)
+        print("                                            FINAL COMPARATIVE BENCHMARK TABLE (GRID EXPERIMENTS)", flush=True)
+        print("=" * 168, flush=True)
+        header = f"{'Configuration':<30} | {'Heldout Top-1':<13} | {'Heldout Q-1':<11} | {'Heldout C-1':<11} | {'CPP 1 in M3':<11} | {'M1 in CPP 3':<11} | {'Top-1 Red':<9} | {'Late Red':<9} | {'Val Effort':<10} | {'Val Red':<8}"
         print(header, flush=True)
-        print("-" * 148, flush=True)
+        print("-" * 168, flush=True)
         m_top1_str = f"{master_stats.get('master_heldout_top1_match', 0.0):.2f}%"
+        m_q1_str = f"{master_stats.get('master_heldout_quiet1_match', 0.0):.2f}%"
+        m_c1_str = f"{master_stats.get('master_heldout_cap1_match', 0.0):.2f}%"
         m_cpp1_in_m3_str = f"{master_stats.get('master_heldout_cpp1_in_m3_match', 0.0):.2f}%"
         m_m1_in_cpp3_str = f"{master_stats.get('master_heldout_m1_in_cpp3_match', 0.0):.2f}%"
         m_r_top1_str = f"{master_stats.get('master_heldout_top1_reduction', 0.0):.2f}"
         m_r_late_str = f"{master_stats.get('master_heldout_late_reduction', 0.0):.2f}"
-        print(f"{'Stockfish Master Baseline':<30} | {m_top1_str:>13} | {m_cpp1_in_m3_str:>12} | {m_m1_in_cpp3_str:>12} | {m_r_top1_str:>10} | {m_r_late_str:>10} | {master_stats['master_mean_effort']:>12.4f} | {master_stats['master_mean_reduction']:>12.4f}", flush=True)
-        print("-" * 148, flush=True)
+        print(f"{'Stockfish Master Baseline':<30} | {m_top1_str:>13} | {m_q1_str:>11} | {m_c1_str:>11} | {m_cpp1_in_m3_str:>11} | {m_m1_in_cpp3_str:>11} | {m_r_top1_str:>9} | {m_r_late_str:>9} | {master_stats['master_mean_effort']:>10.4f} | {master_stats['master_mean_reduction']:>8.4f}", flush=True)
+        print("-" * 168, flush=True)
         for name, s in results.items():
             h_top1_str = f"{s.get('heldout_top1_match', 0.0):.2f}%"
+            h_q1_str = f"{s.get('heldout_quiet1_match', 0.0):.2f}%"
+            h_c1_str = f"{s.get('heldout_cap1_match', 0.0):.2f}%"
             h_cpp1_in_m3_str = f"{s.get('heldout_cpp1_in_m3_match', 0.0):.2f}%"
             h_m1_in_cpp3_str = f"{s.get('heldout_m1_in_cpp3_match', 0.0):.2f}%"
             h_r_top1_str = f"{s.get('heldout_top1_reduction', 0.0):.2f}"
             h_r_late_str = f"{s.get('heldout_late_reduction', 0.0):.2f}"
-            print(f"{name:<30} | {h_top1_str:>13} | {h_cpp1_in_m3_str:>12} | {h_m1_in_cpp3_str:>12} | {h_r_top1_str:>10} | {h_r_late_str:>10} | {s['mean_search_effort']:>12.4f} | {s['mean_reduction']:>12.4f}", flush=True)
-        print("=" * 148 + "\n", flush=True)
+            print(f"{name:<30} | {h_top1_str:>13} | {h_q1_str:>11} | {h_c1_str:>11} | {h_cpp1_in_m3_str:>11} | {h_m1_in_cpp3_str:>11} | {h_r_top1_str:>9} | {h_r_late_str:>9} | {s['mean_search_effort']:>10.4f} | {s['mean_reduction']:>8.4f}", flush=True)
+        print("=" * 168 + "\n", flush=True)
 
     else:
         final_stats = train_single_run(
