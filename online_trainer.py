@@ -435,37 +435,35 @@ def compute_combined_losses(
     w_raw = torch.clamp(torch.sqrt(depth.clamp(min=1.0) / 8.0), 0.70, 1.40)
     w_depth = w_raw / w_raw.mean()
 
-    # 1. Quiet Moves KL & Top-1 Match
+    # 1. Quiet Moves KL & Top-1 Match (Filtered by minimum Monty mass threshold >= 5%)
     quiet_mask = legal_mask & (~is_cap_mask)
     masked_zq = z_quiet.masked_fill(~quiet_mask, -1e4)
     log_probs_q = F.log_softmax(masked_zq / tau_mp, dim=-1)
     p_q = target_p_mp * quiet_mask.float()
-    sum_pq = p_q.sum(dim=-1, keepdim=True)
-    p_q_norm = p_q / (sum_pq + 1e-12)
-    has_quiets = (sum_pq.squeeze(-1) > 1e-6) & (quiet_mask.sum(dim=-1) > 1)
+    w_q_pos = p_q.sum(dim=-1)
+    has_quiets = (w_q_pos >= 0.05) & (quiet_mask.sum(dim=-1) > 1)
 
     loss_mp_kl_q = torch.tensor(0.0, device=z_quiet.device)
     acc_q = torch.tensor(0.0, device=z_quiet.device)
     if has_quiets.sum() > 0:
-        loss_q_pos = -(p_q_norm[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1)
+        loss_q_pos = -(p_q[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1)
         loss_mp_kl_q = (w_depth[has_quiets] * loss_q_pos).mean()
-        acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q_norm[has_quiets].argmax(dim=-1)).float().mean()
+        acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q[has_quiets].argmax(dim=-1)).float().mean()
 
-    # 2. Capture Moves KL & Top-1 Match
+    # 2. Capture Moves KL & Top-1 Match (Filtered by minimum Monty mass threshold >= 5%)
     cap_mask = legal_mask & is_cap_mask
     masked_zc = z_cap.masked_fill(~cap_mask, -1e4)
     log_probs_c = F.log_softmax(masked_zc / tau_mp, dim=-1)
     p_c = target_p_mp * cap_mask.float()
-    sum_pc = p_c.sum(dim=-1, keepdim=True)
-    p_c_norm = p_c / (sum_pc + 1e-12)
-    has_caps = (sum_pc.squeeze(-1) > 1e-6) & (cap_mask.sum(dim=-1) > 1)
+    w_c_pos = p_c.sum(dim=-1)
+    has_caps = (w_c_pos >= 0.05) & (cap_mask.sum(dim=-1) > 1)
 
     loss_mp_kl_c = torch.tensor(0.0, device=z_cap.device)
     acc_c = torch.tensor(0.0, device=z_cap.device)
     if has_caps.sum() > 0:
-        loss_c_pos = -(p_c_norm[has_caps] * log_probs_c[has_caps]).sum(dim=-1)
+        loss_c_pos = -(p_c[has_caps] * log_probs_c[has_caps]).sum(dim=-1)
         loss_mp_kl_c = (w_depth[has_caps] * loss_c_pos).mean()
-        acc_c = (masked_zc[has_caps].argmax(dim=-1) == p_c_norm[has_caps].argmax(dim=-1)).float().mean()
+        acc_c = (masked_zc[has_caps].argmax(dim=-1) == p_c[has_caps].argmax(dim=-1)).float().mean()
 
     # Distributional Shape Matching (Mean + Variance for Quiets and Captures)
     loss_shape_quiet = torch.tensor(0.0, device=z_quiet.device)
@@ -481,7 +479,7 @@ def compute_combined_losses(
         loss_shape_cap = (z_c_nn.mean() - z_c_leg.mean()).pow(2) + (z_c_nn.std() - z_c_leg.std()).pow(2)
 
     loss_mp_shape = loss_shape_quiet + loss_shape_cap
-    loss_mp_total = loss_mp_kl_q + 0.5 * loss_mp_kl_c + mp_shape_coef * loss_mp_shape
+    loss_mp_total = loss_mp_kl_q + loss_mp_kl_c + mp_shape_coef * loss_mp_shape
 
     # 3. Residual Reductions on physical moves
     r_total_nn = r_base + delta_r_nn
@@ -553,33 +551,31 @@ def evaluate_handcrafted_master(
             B, M = z_legacy_mp.shape
             i_star = target_p_mp.argmax(dim=-1)
 
-            # Master Quiet KL
+            # Master Quiet KL (Filtered by minimum Monty mass threshold >= 5%)
             quiet_mask = legal_mask & (~is_cap)
             masked_zq = z_legacy_mp.masked_fill(~quiet_mask, -1e4)
             log_probs_q = F.log_softmax(masked_zq / tau_mp, dim=-1)
             p_q = target_p_mp * quiet_mask.float()
-            sum_pq = p_q.sum(dim=-1, keepdim=True)
-            p_q_norm = p_q / (sum_pq + 1e-12)
-            has_quiets = (sum_pq.squeeze(-1) > 1e-6) & (quiet_mask.sum(dim=-1) > 1)
+            w_q_pos = p_q.sum(dim=-1)
+            has_quiets = (w_q_pos >= 0.05) & (quiet_mask.sum(dim=-1) > 1)
             loss_mp_kl_q = torch.tensor(0.0, device=z_legacy_mp.device)
             acc_q = torch.tensor(0.0, device=z_legacy_mp.device)
             if has_quiets.sum() > 0:
-                loss_mp_kl_q = -(p_q_norm[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1).mean()
-                acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q_norm[has_quiets].argmax(dim=-1)).float().mean()
+                loss_mp_kl_q = -(p_q[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1).mean()
+                acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q[has_quiets].argmax(dim=-1)).float().mean()
 
-            # Master Capture KL
+            # Master Capture KL (Filtered by minimum Monty mass threshold >= 5%)
             cap_mask = legal_mask & is_cap
             masked_zc = z_legacy_mp.masked_fill(~cap_mask, -1e4)
             log_probs_c = F.log_softmax(masked_zc / tau_mp, dim=-1)
             p_c = target_p_mp * cap_mask.float()
-            sum_pc = p_c.sum(dim=-1, keepdim=True)
-            p_c_norm = p_c / (sum_pc + 1e-12)
-            has_caps = (sum_pc.squeeze(-1) > 1e-6) & (cap_mask.sum(dim=-1) > 1)
+            w_c_pos = p_c.sum(dim=-1)
+            has_caps = (w_c_pos >= 0.05) & (cap_mask.sum(dim=-1) > 1)
             loss_mp_kl_c = torch.tensor(0.0, device=z_legacy_mp.device)
             acc_c = torch.tensor(0.0, device=z_legacy_mp.device)
             if has_caps.sum() > 0:
-                loss_mp_kl_c = -(p_c_norm[has_caps] * log_probs_c[has_caps]).sum(dim=-1).mean()
-                acc_c = (masked_zc[has_caps].argmax(dim=-1) == p_c_norm[has_caps].argmax(dim=-1)).float().mean()
+                loss_mp_kl_c = -(p_c[has_caps] * log_probs_c[has_caps]).sum(dim=-1).mean()
+                acc_c = (masked_zc[has_caps].argmax(dim=-1) == p_c[has_caps].argmax(dim=-1)).float().mean()
 
             # Exact physical reductions
             max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
@@ -618,7 +614,7 @@ def evaluate_handcrafted_master(
         "master_cap_top1": (cap_top1_sum / n) * 100.0,
         "master_mp_kl_q": mp_kl_q_sum / n,
         "master_mp_kl_c": mp_kl_c_sum / n,
-        "master_mp_kl": (mp_kl_q_sum + 0.5 * mp_kl_c_sum) / n,
+        "master_mp_kl": (mp_kl_q_sum + mp_kl_c_sum) / n,
         "master_q_search_star": (q_star_sum / n) * 100.0,
         "master_lmr_ord": lmr_ord_sum / n,
         "master_mean_effort": tot_effort_sum / n,
@@ -686,7 +682,7 @@ def evaluate_validation_rollout(
         "total_loss": tot_loss_sum / n,
         "mp_kl_q": mp_kl_q_sum / n,
         "mp_kl_c": mp_kl_c_sum / n,
-        "mp_kl_loss": (mp_kl_q_sum + 0.5 * mp_kl_c_sum) / n,
+        "mp_kl_loss": (mp_kl_q_sum + mp_kl_c_sum) / n,
         "mp_anchor_loss": mp_anc_sum / n,
         "lmr_order_loss": lmr_ord_sum / n,
         "rank_profile_loss": rank_prof_loss_sum / n,
