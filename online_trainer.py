@@ -32,7 +32,7 @@ import sqlite3
 import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import chess
 import numpy as np
@@ -983,26 +983,32 @@ def collect_target_samples(
 
 
 def run_heldout_online_evaluation(
-    model: DualMiniNN,
+    model: Optional[DualMiniNN],
     test_fens: List[str],
+    target_samples: int = 32768,
     nodes_per_fen: int = 50_000,
-    sample_interval: int = 2000,
     workers: int = 4,
     session_tag: str = "heldout_test"
 ) -> Dict[str, float]:
+    tag_name = "NEURAL MININN" if model is not None else "HANDCRAFTED STOCKFISH MASTER"
     print("\n" + "=" * 80, flush=True)
-    print("   HELDOUT ONLINE POLICY & ON-POLICY PARITY EVALUATION", flush=True)
+    print(f"   {tag_name} - HELDOUT ON-POLICY EVALUATION ({target_samples:,} SAMPLES)", flush=True)
     print("=" * 80, flush=True)
 
-    temp_model_path = f"/tmp/online_test_{session_tag}.miniNN"
-    model.export_quantized_binary(temp_model_path)
+    temp_model_path = ""
+    if model is not None:
+        temp_model_path = f"/tmp/online_test_{session_tag}.miniNN"
+        model.export_quantized_binary(temp_model_path)
 
     tel_path = os.path.join(CACHE_DIR, f"heldout_tel_{session_tag}.jsonl")
     db_path = os.path.join(CACHE_DIR, f"heldout_monty_{session_tag}.db")
     if os.path.exists(tel_path):
         os.remove(tel_path)
 
-    # 1. Rollout C++ Stockfish searches on heldout test FENs with latest model loaded
+    # 1. Rollout C++ Stockfish searches on heldout test FENs
+    samples_per_fen = max(1, math.ceil(target_samples / len(test_fens)))
+    sample_interval = max(500, nodes_per_fen // samples_per_fen)
+
     chunk_size = math.ceil(len(test_fens) / workers)
     chunks = [test_fens[i : i + chunk_size] for i in range(0, len(test_fens), chunk_size)]
     worker_tel_paths = [os.path.join(CACHE_DIR, f"heldout_tel_w{w_id}_{session_tag}.jsonl") for w_id in range(len(chunks))]
@@ -1106,8 +1112,13 @@ def run_heldout_online_evaluation(
                         if rank_val == 1:
                             r_val = 0.0
                         else:
-                            base_r = (math.log(max(1, depth_val)) * math.log(max(1, rank_val)) * 500.0) / 1024.0
-                            r_val = base_r
+                            if model is None:
+                                stat_score = m_info.get("stat_score", 0)
+                                r_val = (math.log(max(1, depth_val)) * math.log(max(1, rank_val)) * 500.0 - stat_score * (439.0 / 4096.0)) / 1024.0
+                            else:
+                                base_r = (math.log(max(1, depth_val)) * math.log(max(1, rank_val)) * 500.0) / 1024.0
+                                r_val = base_r
+                            r_val = max(-2.0, min(depth_val - 1.0, r_val))
 
                         if m_info["move"] == top_monty_move:
                             monty_top1_red_sum += r_val
@@ -1130,7 +1141,7 @@ def run_heldout_online_evaluation(
     print(f"Mean LMR Reduction on Other Late Moves:     {mean_late_r:.2f} plies", flush=True)
     print("=" * 80 + "\n", flush=True)
 
-    if os.path.exists(temp_model_path):
+    if temp_model_path and os.path.exists(temp_model_path):
         os.remove(temp_model_path)
 
     return {
@@ -1162,55 +1173,35 @@ def train_single_run(
 ) -> Dict[str, float]:
     print("\n" + "=" * 80, flush=True)
     print(f"   STARTING RUN: {run_name}", flush=True)
-    print("=" * 80, flush=True)
-    print(f"Iterations:                 {args.iterations:,}", flush=True)
-    print(f"Peak Learning Rate:         {lr:.4e}", flush=True)
-    print(f"LR Schedule:                Warmup (min 2 iters) -> Cosine Decay (Floor: {0.30 * lr:.4e})", flush=True)
-    print(f"Rollout Buffer Size:        {args.rollout_samples}", flush=True)
-    print(f"Mini-Batch Size:            {args.minibatch_size}", flush=True)
-    print(f"PPO Multi-Epochs / Iter:    {args.ppo_epochs}", flush=True)
-    print(f"MovePicker Anchor Coef:     {mp_anchor_coef:.2f}", flush=True)
-    print(f"LMR Order Coef (Detached):  {lmr_ord_coef:.2f}", flush=True)
-    print(f"Rank-Profile MSE Coef:      {rank_profile_coef:.2f}", flush=True)
-    print(f"Lean Tree Upward Push Coef: {push_up_coef:.4f}", flush=True)
-    print(f"Output Binary:              {output_path}", flush=True)
-    print("=" * 80, flush=True)
+    print(f"   LR = {lr:.4e} | MP Anchor = {mp_anchor_coef:.2f} | LMR Ord = {lmr_ord_coef:.2f} | Rank Profile = {rank_profile_coef:.2f} | Push Up = {push_up_coef:.3f}", flush=True)
+    print("=" * 80 + "\n", flush=True)
 
-    model = DualMiniNN()
-    model.export_quantized_binary(output_path)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    model = DualMiniNN().train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.iterations, eta_min=1e-4)
 
-    steps_per_epoch = max(1, math.ceil(args.rollout_samples / args.minibatch_size))
-    total_training_steps = args.iterations * args.ppo_epochs * steps_per_epoch
-
-    warmup_iters = min(5, max(2, args.iterations // 5))
-    warmup_steps = warmup_iters * args.ppo_epochs * steps_per_epoch
-
-    scheduler = get_onpolicy_warmup_cosine_scheduler(
-        optimizer,
-        total_steps=total_training_steps,
-        warmup_steps=warmup_steps,
-        floor_ratio=0.30
-    )
-
-    fen_ptr = 0
+    curr_fen_offset = 0
     total_gradient_steps = 0
 
     for iteration in range(1, args.iterations + 1):
         t0 = time.time()
+        temp_model_path = f"/tmp/{run_name}_iter{iteration}.miniNN"
+        model.export_quantized_binary(temp_model_path)
 
-        fresh_tel, fresh_db, fen_ptr = collect_target_samples(
+        fresh_tel, fresh_db, curr_fen_offset = collect_target_samples(
             fens_pool=train_fens_pool,
-            fen_offset=fen_ptr,
+            fen_offset=curr_fen_offset,
             target_samples=args.rollout_samples,
             nodes_per_fen=args.nodes,
             sample_interval=args.sample_interval,
-            model_path=output_path,
+            model_path=temp_model_path,
             workers=args.workers,
-            session_tag=f"rollout_{run_name}"
+            session_tag=f"{run_name}_iter{iteration}"
         )
+        if os.path.exists(temp_model_path):
+            os.remove(temp_model_path)
 
-        rollout_dataset = RolloutDataset(
+        train_dataset = RolloutDataset(
             telemetry_path=fresh_tel,
             monty_db_path=fresh_db,
             floor_lmr=floor_lmr,
@@ -1218,23 +1209,19 @@ def train_single_run(
             t_lmr=t_lmr,
             t_mp=t_mp
         )
+        train_loader = DataLoader(train_dataset, batch_size=args.minibatch_size, shuffle=True)
 
-        loader = DataLoader(rollout_dataset, batch_size=args.minibatch_size, shuffle=True)
-        iter_steps = 0
-        iter_loss, iter_mp_kl, iter_lmr_ord = 0.0, 0.0, 0.0
-
-        for ppo_epoch in range(args.ppo_epochs):
-            for batch in loader:
-                u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, legal_mask, depth = batch
+        iter_loss, iter_mp_kl, iter_lmr_ord, iter_steps = 0.0, 0.0, 0.0, 0
+        for epoch in range(args.ppo_epochs):
+            for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, legal_mask, depth in train_loader:
                 optimizer.zero_grad()
-
                 w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, cap_scores, delta_r_nn = model(u_node, x_quiet, x_cap, x_lmr)
 
                 z_quiet = quiet_scores / 32768.0
                 z_cap = cap_scores / 32768.0
                 z_mp = torch.where(is_cap, z_cap, z_quiet)
 
-                loss, loss_mp_kl, loss_mp_shape, loss_lmr_ord, loss_rank_prof, loss_push, mp_top1_acc, mean_q_star = compute_combined_losses(
+                loss, loss_mp_kl, loss_mp_shape, loss_lmr_ord, loss_rank_prof, loss_push, _, _ = compute_combined_losses(
                     z_mp, delta_r_nn, tau_mp, tau_lmr, target_p_mp, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
                     mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
                 )
@@ -1242,40 +1229,21 @@ def train_single_run(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                scheduler.step()
-
                 total_gradient_steps += 1
+
                 iter_steps += 1
                 iter_loss += loss.item()
                 iter_mp_kl += loss_mp_kl.item()
                 iter_lmr_ord += loss_lmr_ord.item()
 
-                if total_gradient_steps % args.sync_interval == 0:
-                    model.export_quantized_binary(output_path)
-
+        scheduler.step()
         try:
-            if os.path.exists(fresh_tel):
-                os.remove(fresh_tel)
-            if os.path.exists(fresh_db):
-                os.remove(fresh_db)
-        except Exception:
-            pass
+            if os.path.exists(fresh_tel): os.remove(fresh_tel)
+            if os.path.exists(fresh_db): os.remove(fresh_db)
+        except Exception: pass
 
-        elapsed_iter = time.time() - t0
-        curr_lr = scheduler.get_last_lr()[0]
-        n_steps = max(1, iter_steps)
-
-        if iteration % args.val_freq == 0 or iteration == 1 or iteration == args.iterations:
-            val_stats = evaluate_validation_rollout(
-                model, val_loader,
-                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
-            )
-            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
-                  f"Train Loss: {iter_loss/n_steps:.4f} (MP_KL: {iter_mp_kl/n_steps:.3f}, LMR_Ord: {iter_lmr_ord/n_steps:.3f}) | "
-                  f"Val MP Top-1: {val_stats['mp_top1_acc']:5.2f}% | Val Search Alloc Q(i*): {val_stats['mean_q_search_star']:5.2f}% | Effort: {val_stats['mean_search_effort']:.3f} | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
-        else:
-            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
-                  f"Train Loss: {iter_loss/n_steps:.4f} (MP_KL: {iter_mp_kl/n_steps:.3f}, LMR_Ord: {iter_lmr_ord/n_steps:.3f})", flush=True)
+        if iteration % args.val_freq == 0 or iteration == args.iterations:
+            print(f"[{run_name} | Iter {iteration:>4d}] Loss: {iter_loss/max(1, iter_steps):.4f} (KL: {iter_mp_kl/max(1, iter_steps):.3f})", flush=True)
 
     final_stats = evaluate_validation_rollout(
         model, val_loader,
@@ -1286,13 +1254,13 @@ def train_single_run(
     # Output detailed 2D Depth x Rank Evaluation Matrix
     evaluate_2d_depth_rank_matrix(model, val_loader, tau_lmr=t_lmr)
 
-    # Final Online Testing Step on Heldout FENs
+    # Final Online Testing Step on Heldout FENs (Matching val_samples scale)
     if test_fens_pool:
         heldout_stats = run_heldout_online_evaluation(
             model=model,
-            test_fens=test_fens_pool[:min(len(test_fens_pool), 1000)],
-            nodes_per_fen=min(50_000, args.nodes),
-            sample_interval=args.sample_interval,
+            test_fens=test_fens_pool,
+            target_samples=args.val_samples,
+            nodes_per_fen=args.nodes,
             workers=args.workers,
             session_tag=f"{run_name}_heldout"
         )
@@ -1375,7 +1343,7 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=args.minibatch_size, shuffle=False)
     print(f"      Validation set ready: {len(val_dataset):,} samples in {time.time() - t_v0:.1f}s.\n", flush=True)
 
-    # Master Baseline Evaluation
+    # Master Baseline Offline Evaluation
     print("=" * 80, flush=True)
     print("      HANDCRAFTED STOCKFISH MASTER BASELINE (ON UNBIASED 2^15 VALIDATION SET)", flush=True)
     print("=" * 80, flush=True)
@@ -1389,6 +1357,19 @@ def main():
     print(f"{'Mean Late-Move Search Effort (E_leg)':<40} | {master_stats['master_mean_effort']:<25.4f}", flush=True)
     print(f"{'Mean Reduction (Plies)':<40} | {master_stats['master_mean_reduction']:<25.4f}", flush=True)
     print("=" * 80 + "\n", flush=True)
+
+    # Master Baseline On-Policy Heldout Evaluation
+    master_heldout_stats = {}
+    if test_fens_pool:
+        master_heldout_stats = run_heldout_online_evaluation(
+            model=None, # Master Stockfish (no miniNN model)
+            test_fens=test_fens_pool,
+            target_samples=args.val_samples,
+            nodes_per_fen=args.nodes,
+            workers=args.workers,
+            session_tag="master_heldout_shared"
+        )
+        master_stats.update({f"master_{k}": v for k, v in master_heldout_stats.items()})
 
     if args.grid:
         grid_configs = [
@@ -1425,21 +1406,29 @@ def main():
             )
             results[cfg["name"]] = stats
 
-        print("\n" + "=" * 110, flush=True)
-        print("                   FINAL COMPARATIVE BENCHMARK TABLE (GRID EXPERIMENTS)", flush=True)
-        print("=" * 110, flush=True)
-        header = f"{'Configuration':<35} | {'MP Top-1':<10} | {'MP KL':<8} | {'Q(i*) Alloc':<12} | {'Effort E':<10} | {'Mean Red (Ply)':<14}"
+        print("\n" + "=" * 135, flush=True)
+        print("                                  FINAL COMPARATIVE BENCHMARK TABLE (GRID EXPERIMENTS)", flush=True)
+        print("=" * 135, flush=True)
+        header = f"{'Configuration':<32} | {'Heldout Top-1':<13} | {'Heldout Top-3':<13} | {'Top-1 Red':<10} | {'Late Red':<10} | {'Val Effort E':<12} | {'Val Mean Red':<12}"
         print(header, flush=True)
-        print("-" * 110, flush=True)
-        print(f"{'Stockfish Master Baseline':<35} | {master_stats['master_mp_top1']:>9.2f}% | {master_stats['master_mp_kl']:>8.4f} | {master_stats['master_q_search_star']:>11.2f}% | {master_stats['master_mean_effort']:>10.4f} | {master_stats['master_mean_reduction']:>14.4f}", flush=True)
-        print("-" * 110, flush=True)
+        print("-" * 135, flush=True)
+        m_top1_str = f"{master_stats.get('master_heldout_top1_match', 0.0):.2f}%"
+        m_top3_str = f"{master_stats.get('master_heldout_top3_match', 0.0):.2f}%"
+        m_r_top1_str = f"{master_stats.get('master_heldout_top1_reduction', 0.0):.2f}"
+        m_r_late_str = f"{master_stats.get('master_heldout_late_reduction', 0.0):.2f}"
+        print(f"{'Stockfish Master Baseline':<32} | {m_top1_str:>13} | {m_top3_str:>13} | {m_r_top1_str:>10} | {m_r_late_str:>10} | {master_stats['master_mean_effort']:>12.4f} | {master_stats['master_mean_reduction']:>12.4f}", flush=True)
+        print("-" * 135, flush=True)
         for name, s in results.items():
-            print(f"{name:<35} | {s['mp_top1_acc']:>9.2f}% | {s['mp_kl_loss']:>8.4f} | {s['mean_q_search_star']:>11.2f}% | {s['mean_search_effort']:>10.4f} | {s['mean_reduction']:>14.4f}", flush=True)
-        print("=" * 110 + "\n", flush=True)
+            h_top1_str = f"{s.get('heldout_top1_match', 0.0):.2f}%"
+            h_top3_str = f"{s.get('heldout_top3_match', 0.0):.2f}%"
+            h_r_top1_str = f"{s.get('heldout_top1_reduction', 0.0):.2f}"
+            h_r_late_str = f"{s.get('heldout_top1_reduction', 0.0):.2f}"
+            print(f"{name:<32} | {h_top1_str:>13} | {h_top3_str:>13} | {h_r_top1_str:>10} | {h_r_late_str:>10} | {s['mean_search_effort']:>12.4f} | {s['mean_reduction']:>12.4f}", flush=True)
+        print("=" * 135 + "\n", flush=True)
 
     else:
         final_stats = train_single_run(
-            run_name="Single_Push5e2_Run",
+            run_name="Single_Push6e2_Run",
             lr=args.lr,
             mp_anchor_coef=args.mp_anchor_coef,
             lmr_ord_coef=args.lmr_ord_coef,
