@@ -529,86 +529,140 @@ def compute_combined_losses(
     return loss_total, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_order, loss_rank_profile, acc_q, acc_c, mean_q_star
 
 
+def compute_standardized_rollout_metrics(
+    p_target: torch.Tensor,
+    r_real: torch.Tensor,
+    z_q: torch.Tensor,
+    z_c: torch.Tensor,
+    is_cap: torch.Tensor,
+    legal_mask: torch.Tensor,
+    tau_mp: torch.Tensor,
+    tau_lmr: torch.Tensor
+) -> Dict[str, float]:
+    """
+    Standardized, canonical metric calculation across all evaluation streams.
+    """
+    B, M = p_target.shape
+    i_star = p_target.argmax(dim=-1)
+
+    # 1. MovePicker Sub-Distributions (Filtered >= 5% mass)
+    quiet_mask = legal_mask & (~is_cap)
+    masked_zq = z_q.masked_fill(~quiet_mask, -1e4)
+    log_probs_q = F.log_softmax(masked_zq / tau_mp, dim=-1)
+    p_q = p_target * quiet_mask.float()
+    w_q_pos = p_q.sum(dim=-1)
+    has_quiets = (w_q_pos >= 0.05) & (quiet_mask.sum(dim=-1) > 1)
+    mp_kl_q = -(p_q[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1).mean() if has_quiets.sum() > 0 else torch.tensor(0.0)
+    acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q[has_quiets].argmax(dim=-1)).float().mean() if has_quiets.sum() > 0 else torch.tensor(0.0)
+
+    cap_mask = legal_mask & is_cap
+    masked_zc = z_c.masked_fill(~cap_mask, -1e4)
+    log_probs_c = F.log_softmax(masked_zc / tau_mp, dim=-1)
+    p_c = p_target * cap_mask.float()
+    w_c_pos = p_c.sum(dim=-1)
+    has_caps = (w_c_pos >= 0.05) & (cap_mask.sum(dim=-1) > 1)
+    mp_kl_c = -(p_c[has_caps] * log_probs_c[has_caps]).sum(dim=-1).mean() if has_caps.sum() > 0 else torch.tensor(0.0)
+    acc_c = (masked_zc[has_caps].argmax(dim=-1) == p_c[has_caps].argmax(dim=-1)).float().mean() if has_caps.sum() > 0 else torch.tensor(0.0)
+
+    # 2. Search Effort & Allocation
+    masked_r = r_real.masked_fill(~legal_mask, 1e4)
+    E_late = torch.exp(-masked_r / tau_lmr) * legal_mask.float()
+    E_eff = E_late.clone()
+    E_eff[:, 0] = 1.0
+    D = E_eff.sum(dim=-1, keepdim=True)
+    Q_dist = E_eff / (D + 1e-12)
+    lmr_policy_loss = -(p_target * torch.log(Q_dist + 1e-12)).sum(dim=-1).mean()
+    q_star = Q_dist.gather(1, i_star.unsqueeze(1)).squeeze(1).mean()
+
+    # 3. Physical Ordering & Top-1 Metrics
+    top1_match = (i_star == 0).float().mean()
+    sorted_p = p_target.argsort(dim=-1, descending=True)
+    m1_in_top3 = (sorted_p[:, :3] == 0).any(dim=-1).float().mean()
+    top1_in_m3 = (i_star < 3).float().mean()
+
+    # 4. Reductions
+    top1_red = r_real.gather(1, i_star.unsqueeze(1)).squeeze(1).mean()
+    other_late_mask = legal_mask.clone()
+    other_late_mask[:, 0] = False
+    other_late_mask.scatter_(1, i_star.unsqueeze(1), False)
+    late_red = r_real[other_late_mask].mean() if other_late_mask.sum() > 0 else torch.tensor(0.0)
+
+    mean_effort = (E_late[:, 1:]).sum(dim=-1).mean()
+    mean_red = r_real[legal_mask].mean()
+
+    return {
+        "top1_match": top1_match.item() * 100.0,
+        "quiet_top1": acc_q.item() * 100.0,
+        "cap_top1": acc_c.item() * 100.0,
+        "cpp1_in_m3_match": m1_in_top3.item() * 100.0,
+        "m1_in_cpp3_match": top1_in_m3.item() * 100.0,
+        "mp_kl_q": mp_kl_q.item(),
+        "mp_kl_c": mp_kl_c.item(),
+        "mp_kl_loss": (mp_kl_q + mp_kl_c).item(),
+        "q_search_star": q_star.item() * 100.0,
+        "lmr_policy_loss": lmr_policy_loss.item(),
+        "top1_reduction": top1_red.item(),
+        "late_reduction": late_red.item(),
+        "mean_effort": mean_effort.item(),
+        "mean_reduction": mean_red.item()
+    }
+
+
+def print_unified_benchmark_report(title: str, stats: Dict[str, float]):
+    print("=" * 80, flush=True)
+    print(f"      {title.upper()} EVALUATION REPORT", flush=True)
+    print("=" * 80, flush=True)
+    print(f"{'Physical Move 1 == Monty Top-1 Match:':<45} {stats.get('top1_match', 0.0):.2f}%", flush=True)
+    print(f"{'  - Physical Quiet 1 Match (within Q):':<45} {stats.get('quiet_top1', 0.0):.2f}%", flush=True)
+    print(f"{'  - Physical Capture 1 Match (within C):':<45} {stats.get('cap_top1', 0.0):.2f}%", flush=True)
+    print(f"{'Physical Move 1 in Monty Top-3 Match:':<45} {stats.get('cpp1_in_m3_match', 0.0):.2f}%", flush=True)
+    print(f"{'Monty Top-1 in Physical Move 1..3 Match:':<45} {stats.get('m1_in_cpp3_match', 0.0):.2f}% (Dual)", flush=True)
+    print(f"{'MovePicker Quiet KL Divergence:':<45} {stats.get('mp_kl_q', 0.0):.4f}", flush=True)
+    print(f"{'MovePicker Capture KL Divergence:':<45} {stats.get('mp_kl_c', 0.0):.4f}", flush=True)
+    print(f"{'Mean Top Move Search Allocation Q(i*):':<45} {stats.get('q_search_star', 0.0):.2f}%", flush=True)
+    print(f"{'LMR Policy Cross-Entropy Loss:':<45} {stats.get('lmr_policy_loss', 0.0):.4f}", flush=True)
+    print(f"{'Mean LMR Reduction on Monty Top-1 Move:':<45} {stats.get('top1_reduction', 0.0):.2f} plies", flush=True)
+    print(f"{'Mean LMR Reduction on Other Late Moves:':<45} {stats.get('late_reduction', 0.0):.2f} plies", flush=True)
+    print(f"{'Mean Late-Move Search Effort (E):':<45} {stats.get('mean_effort', 0.0):.4f}", flush=True)
+    print(f"{'Mean Total Reduction:':<45} {stats.get('mean_reduction', 0.0):.4f} plies", flush=True)
+    print("=" * 80 + "\n", flush=True)
+
+
 def evaluate_handcrafted_master(
     loader: DataLoader,
     tau_mp: float = 0.1154,
     tau_lmr: float = 0.8658
 ) -> Dict[str, float]:
-    mp_kl_q_sum, mp_kl_c_sum, lmr_ord_sum = 0.0, 0.0, 0.0
-    quiet_top1_sum, cap_top1_sum, q_star_sum = 0.0, 0.0, 0.0
-    total_count, tot_effort_sum, mean_r_sum = 0, 0.0, 0.0
+    stat_sums = {}
+    total_count = 0
 
     with torch.no_grad():
         for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, legal_mask, depth in loader:
             B, M = z_legacy_mp.shape
-            i_star = target_p_mp.argmax(dim=-1)
-
-            # Master Quiet KL (Filtered by minimum Monty mass threshold >= 5%)
-            quiet_mask = legal_mask & (~is_cap)
-            masked_zq = z_legacy_mp.masked_fill(~quiet_mask, -1e4)
-            log_probs_q = F.log_softmax(masked_zq / tau_mp, dim=-1)
-            p_q = target_p_mp * quiet_mask.float()
-            w_q_pos = p_q.sum(dim=-1)
-            has_quiets = (w_q_pos >= 0.05) & (quiet_mask.sum(dim=-1) > 1)
-            loss_mp_kl_q = torch.tensor(0.0, device=z_legacy_mp.device)
-            acc_q = torch.tensor(0.0, device=z_legacy_mp.device)
-            if has_quiets.sum() > 0:
-                loss_mp_kl_q = -(p_q[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1).mean()
-                acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q[has_quiets].argmax(dim=-1)).float().mean()
-
-            # Master Capture KL (Filtered by minimum Monty mass threshold >= 5%)
-            cap_mask = legal_mask & is_cap
-            masked_zc = z_legacy_mp.masked_fill(~cap_mask, -1e4)
-            log_probs_c = F.log_softmax(masked_zc / tau_mp, dim=-1)
-            p_c = target_p_mp * cap_mask.float()
-            w_c_pos = p_c.sum(dim=-1)
-            has_caps = (w_c_pos >= 0.05) & (cap_mask.sum(dim=-1) > 1)
-            loss_mp_kl_c = torch.tensor(0.0, device=z_legacy_mp.device)
-            acc_c = torch.tensor(0.0, device=z_legacy_mp.device)
-            if has_caps.sum() > 0:
-                loss_mp_kl_c = -(p_c[has_caps] * log_probs_c[has_caps]).sum(dim=-1).mean()
-                acc_c = (masked_zc[has_caps].argmax(dim=-1) == p_c[has_caps].argmax(dim=-1)).float().mean()
-
-            # Exact physical reductions
             max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
             min_red = torch.tensor(-2.0, device=r_legacy.device)
             r_real_leg = torch.minimum(torch.maximum(r_legacy, min_red), max_red)
 
-            masked_r = r_real_leg.masked_fill(~legal_mask, 1e4)
-            E_late = torch.exp(-masked_r / tau_lmr) * legal_mask.float()
-            E_eff = E_late.clone()
-            E_eff[:, 0] = 1.0
+            tau_mp_t = torch.tensor(tau_mp, device=z_legacy_mp.device)
+            tau_lmr_t = torch.tensor(tau_lmr, device=z_legacy_mp.device)
 
-            D = E_eff.sum(dim=-1, keepdim=True)
-            Q_dist = E_eff / (D + 1e-12)
-            loss_lmr_order = -(target_p_mp * torch.log(Q_dist + 1e-12)).sum(dim=-1).mean()
-
-            Q_star = Q_dist.gather(1, i_star.unsqueeze(1)).squeeze(1)
-            effort_leg_late = (E_late[:, 1:]).sum(dim=-1).mean()
-            mean_r = r_real_leg[legal_mask].mean()
+            b_stats = compute_standardized_rollout_metrics(
+                p_target=target_p_mp,
+                r_real=r_real_leg,
+                z_q=z_legacy_mp,
+                z_c=z_legacy_mp,
+                is_cap=is_cap,
+                legal_mask=legal_mask,
+                tau_mp=tau_mp_t,
+                tau_lmr=tau_lmr_t
+            )
 
             total_count += B
-            mp_kl_q_sum += loss_mp_kl_q.item() * B
-            mp_kl_c_sum += loss_mp_kl_c.item() * B
-            lmr_ord_sum += loss_lmr_order.item() * B
-            quiet_top1_sum += acc_q.item() * B
-            cap_top1_sum += acc_c.item() * B
-            q_star_sum += Q_star.mean().item() * B
-            tot_effort_sum += effort_leg_late.item() * B
-            mean_r_sum += mean_r.item() * B
+            for k, v in b_stats.items():
+                stat_sums[k] = stat_sums.get(k, 0.0) + v * B
 
     n = max(1, total_count)
-    return {
-        "master_quiet_top1": (quiet_top1_sum / n) * 100.0,
-        "master_cap_top1": (cap_top1_sum / n) * 100.0,
-        "master_mp_kl_q": mp_kl_q_sum / n,
-        "master_mp_kl_c": mp_kl_c_sum / n,
-        "master_mp_kl": (mp_kl_q_sum + mp_kl_c_sum) / n,
-        "master_q_search_star": (q_star_sum / n) * 100.0,
-        "master_lmr_ord": lmr_ord_sum / n,
-        "master_mean_effort": tot_effort_sum / n,
-        "master_mean_reduction": mean_r_sum / n,
-    }
+    return {k: v / n for k, v in stat_sums.items()}
 
 
 def evaluate_validation_rollout(
@@ -620,10 +674,9 @@ def evaluate_validation_rollout(
     tau_lmr: float = 0.8658
 ) -> Dict[str, float]:
     model.eval()
-    tot_loss_sum, mp_kl_q_sum, mp_kl_c_sum, mp_anc_sum, lmr_ord_sum = 0.0, 0.0, 0.0, 0.0, 0.0
-    rank_prof_loss_sum = 0.0
-    quiet_top1_sum, cap_top1_sum, q_star_sum = 0.0, 0.0, 0.0
-    actual_effort_sum, actual_r_sum, total_count = 0.0, 0.0, 0
+    tot_loss_sum, mp_anc_sum, rank_prof_loss_sum = 0.0, 0.0, 0.0
+    stat_sums = {}
+    total_count = 0
 
     with torch.no_grad():
         for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, legal_mask, depth in loader:
@@ -637,47 +690,38 @@ def evaluate_validation_rollout(
                 mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
             )
 
-            B = u_node.size(0)
-            total_count += B
-            tot_loss_sum += loss.item() * B
-            mp_kl_q_sum += loss_mp_kl_q.item() * B
-            mp_kl_c_sum += loss_mp_kl_c.item() * B
-            mp_anc_sum += loss_mp_shape.item() * B
-            lmr_ord_sum += loss_lmr_ord.item() * B
-            rank_prof_loss_sum += loss_rank_prof.item() * B
-            quiet_top1_sum += acc_q.item() * B
-            cap_top1_sum += acc_c.item() * B
-            q_star_sum += mean_q_star.item() * B
-
             r_total_nn = r_base + delta_r_nn
             max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
             min_red = torch.tensor(-2.0, device=delta_r_nn.device)
             r_real_nn = torch.minimum(torch.maximum(r_total_nn, min_red), max_red)
 
-            masked_r = r_real_nn.masked_fill(~legal_mask, 1e4)
-            E_late = torch.exp(-masked_r / tau_lmr) * legal_mask.float()
-            actual_effort = (E_late[:, 1:]).sum(dim=-1).mean()
-            mean_r = (r_real_nn * legal_mask.float()).sum() / legal_mask.sum()
+            b_stats = compute_standardized_rollout_metrics(
+                p_target=target_p_mp,
+                r_real=r_real_nn,
+                z_q=z_quiet,
+                z_c=z_cap,
+                is_cap=is_cap,
+                legal_mask=legal_mask,
+                tau_mp=tau_mp,
+                tau_lmr=tau_lmr
+            )
 
-            actual_effort_sum += actual_effort.item() * B
-            actual_r_sum += mean_r.item() * B
+            B = u_node.size(0)
+            total_count += B
+            tot_loss_sum += loss.item() * B
+            mp_anc_sum += loss_mp_shape.item() * B
+            rank_prof_loss_sum += loss_rank_prof.item() * B
+
+            for k, v in b_stats.items():
+                stat_sums[k] = stat_sums.get(k, 0.0) + v * B
 
     model.train()
     n = max(1, total_count)
-    return {
-        "total_loss": tot_loss_sum / n,
-        "mp_kl_q": mp_kl_q_sum / n,
-        "mp_kl_c": mp_kl_c_sum / n,
-        "mp_kl_loss": (mp_kl_q_sum + mp_kl_c_sum) / n,
-        "mp_anchor_loss": mp_anc_sum / n,
-        "lmr_order_loss": lmr_ord_sum / n,
-        "rank_profile_loss": rank_prof_loss_sum / n,
-        "mp_quiet_top1": (quiet_top1_sum / n) * 100.0,
-        "mp_cap_top1": (cap_top1_sum / n) * 100.0,
-        "mean_q_search_star": (q_star_sum / n) * 100.0,
-        "mean_search_effort": actual_effort_sum / n,
-        "mean_reduction": actual_r_sum / n,
-    }
+    res = {k: v / n for k, v in stat_sums.items()}
+    res["total_loss"] = tot_loss_sum / n
+    res["mp_anchor_loss"] = mp_anc_sum / n
+    res["rank_profile_loss"] = rank_prof_loss_sum / n
+    return res
 
 
 def evaluate_2d_depth_rank_matrix(
@@ -1075,123 +1119,28 @@ def run_heldout_online_evaluation(
 
             merge_worker_dbs(db_path, worker_db_paths)
 
-    # 3. Compute On-Policy Physical Move 1 match vs Monty Oracle
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    monty_policies = {}
-    for r in cur.execute("SELECT fen, policy_json FROM policies"):
-        monty_policies[r[0]] = json.loads(r[1])
-    conn.close()
+    # 3. Load heldout rollout dataset and evaluate standardized metrics
+    heldout_dataset = RolloutDataset(
+        telemetry_path=tel_path,
+        monty_db_path=db_path,
+        floor_lmr=0.010,
+        floor_mp=0.010,
+        t_lmr=0.8658,
+        t_mp=0.1154
+    )
+    heldout_loader = DataLoader(heldout_dataset, batch_size=256, shuffle=False)
 
-    total_positions = 0
-    top1_matches = 0
-    quiet1_matches, total_quiet_pos = 0, 0
-    cap1_matches, total_cap_pos = 0, 0
-    cpp1_in_m3_matches = 0
-    m1_in_cpp3_matches = 0
-    monty_top1_red_sum = 0.0
-    monty_top1_count = 0
-    late_moves_red_sum = 0.0
-    late_moves_count = 0
+    if model is None:
+        heldout_stats = evaluate_handcrafted_master(heldout_loader)
+    else:
+        heldout_stats = evaluate_validation_rollout(model, heldout_loader)
 
-    if os.path.exists(tel_path):
-        with open(tel_path, "r") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    s = json.loads(line.strip())
-                except Exception:
-                    continue
-                fen = s["fen"]
-                moves = s.get("moves", [])
-                if not moves or fen not in monty_policies:
-                    continue
-
-                top_cpp_move = moves[0]["move"]
-                top3_cpp_moves = [m["move"] for m in moves[:min(3, len(moves))]]
-                m_poly = monty_policies[fen]
-                sorted_monty = sorted(m_poly.keys(), key=lambda m: m_poly[m], reverse=True)
-
-                if sorted_monty:
-                    top_monty_move = sorted_monty[0]
-                    if top_cpp_move == top_monty_move:
-                        top1_matches += 1
-                    if top_cpp_move in sorted_monty[:3]:
-                        cpp1_in_m3_matches += 1
-                    if top_monty_move in top3_cpp_moves:
-                        m1_in_cpp3_matches += 1
-
-                    # Quiet moves on-policy match
-                    quiets = [m for m in moves if not m.get("is_capture", False)]
-                    monty_quiets = [m for m in sorted_monty if any(qm["move"] == m for qm in quiets)]
-                    if len(quiets) >= 2 and monty_quiets and sum(m_poly.get(m, 0.0) for m in monty_quiets) >= 0.05:
-                        total_quiet_pos += 1
-                        if quiets[0]["move"] == monty_quiets[0]:
-                            quiet1_matches += 1
-
-                    # Capture moves on-policy match
-                    caps = [m for m in moves if m.get("is_capture", False)]
-                    monty_caps = [m for m in sorted_monty if any(cm["move"] == m for cm in caps)]
-                    if len(caps) >= 2 and monty_caps and sum(m_poly.get(m, 0.0) for m in monty_caps) >= 0.05:
-                        total_cap_pos += 1
-                        if caps[0]["move"] == monty_caps[0]:
-                            cap1_matches += 1
-
-                    depth_val = s.get("depth", 8)
-                    for m_idx, m_info in enumerate(moves):
-                        rank_val = m_info.get("picker_rank", m_idx + 1)
-                        if rank_val == 1:
-                            r_val = 0.0
-                        else:
-                            if model is None:
-                                stat_score = m_info.get("stat_score", 0)
-                                r_val = (math.log(max(1, depth_val)) * math.log(max(1, rank_val)) * 500.0 - stat_score * (439.0 / 4096.0)) / 1024.0
-                            else:
-                                base_r = (math.log(max(1, depth_val)) * math.log(max(1, rank_val)) * 500.0) / 1024.0
-                                r_val = base_r
-                            r_val = max(-2.0, min(depth_val - 1.0, r_val))
-
-                        if m_info["move"] == top_monty_move:
-                            monty_top1_red_sum += r_val
-                            monty_top1_count += 1
-                        elif rank_val >= 2:
-                            late_moves_red_sum += r_val
-                            late_moves_count += 1
-
-                total_positions += 1
-
-    top1_pct = (top1_matches / max(1, total_positions)) * 100.0
-    quiet1_pct = (quiet1_matches / max(1, total_quiet_pos)) * 100.0
-    cap1_pct = (cap1_matches / max(1, total_cap_pos)) * 100.0
-    cpp1_in_m3_pct = (cpp1_in_m3_matches / max(1, total_positions)) * 100.0
-    m1_in_cpp3_pct = (m1_in_cpp3_matches / max(1, total_positions)) * 100.0
-    mean_top1_r = monty_top1_red_sum / max(1, monty_top1_count)
-    mean_late_r = late_moves_red_sum / max(1, late_moves_count)
-
-    print(f"Heldout Positions Evaluated:                {total_positions:,}", flush=True)
-    print(f"Physical C++ Move 1 == Monty Top-1 Match:   {top1_pct:.2f}%", flush=True)
-    print(f"  - Physical C++ Quiet 1 Match (within Q):  {quiet1_pct:.2f}%", flush=True)
-    print(f"  - Physical C++ Capture 1 Match (within C):{cap1_pct:.2f}%", flush=True)
-    print(f"Physical C++ Move 1 in Monty Top-3 Match:   {cpp1_in_m3_pct:.2f}%", flush=True)
-    print(f"Monty Top-1 in Physical C++ Top-3 Match:   {m1_in_cpp3_pct:.2f}% (Dual)", flush=True)
-    print(f"Mean LMR Reduction on Monty Top-1 Move:     {mean_top1_r:.2f} plies", flush=True)
-    print(f"Mean LMR Reduction on Other Late Moves:     {mean_late_r:.2f} plies", flush=True)
-    print("=" * 80 + "\n", flush=True)
+    print_unified_benchmark_report("Neural MiniNN Heldout Test Set (1,000 FENs)", heldout_stats)
 
     if temp_model_path and os.path.exists(temp_model_path):
         os.remove(temp_model_path)
 
-    return {
-        "heldout_top1_match": top1_pct,
-        "heldout_quiet1_match": quiet1_pct,
-        "heldout_cap1_match": cap1_pct,
-        "heldout_cpp1_in_m3_match": cpp1_in_m3_pct,
-        "heldout_m1_in_cpp3_match": m1_in_cpp3_pct,
-        "heldout_top1_reduction": mean_top1_r,
-        "heldout_late_reduction": mean_late_r,
-        "heldout_total_pos": total_positions
-    }
+    return {f"heldout_{k}": v for k, v in heldout_stats.items()}
 
 
 def train_single_run(
@@ -1320,7 +1269,7 @@ def train_single_run(
             )
             print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
                   f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Pol: {iter_lmr_ord/n_steps:.3f}) | "
-                  f"Val MP: (Q:{val_stats['mp_quiet_top1']:5.2f}%, C:{val_stats['mp_cap_top1']:5.2f}%) | Val Alloc Q(i*): {val_stats['mean_q_search_star']:5.2f}% | Effort: {val_stats['mean_search_effort']:.3f} | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
+                  f"Val MP: (Q:{val_stats['quiet_top1']:5.2f}%, C:{val_stats['cap_top1']:5.2f}%) | Val Alloc Q(i*): {val_stats['q_search_star']:5.2f}% | Effort: {val_stats['mean_effort']:.3f} | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
         else:
             print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
                   f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Pol: {iter_lmr_ord/n_steps:.3f})", flush=True)
@@ -1423,35 +1372,9 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=args.minibatch_size, shuffle=False)
     print(f"      Validation set ready: {len(val_dataset):,} samples in {time.time() - t_v0:.1f}s.\n", flush=True)
 
-    # Master Baseline Offline Evaluation
-    print("=" * 80, flush=True)
-    print("      HANDCRAFTED STOCKFISH MASTER BASELINE (ON UNBIASED 2^15 VALIDATION SET)", flush=True)
-    print("=" * 80, flush=True)
+    # Master Baseline Evaluation on Fixed 2^15 Validation Set
     master_stats = evaluate_handcrafted_master(val_loader, tau_mp=t_mp, tau_lmr=t_lmr)
-    print(f"{'Metric':<40} | {'Handcrafted Stockfish Master':<25}", flush=True)
-    print("-" * 80, flush=True)
-    print(f"{'Quiet Moves Top-1 Match (within quiets)':<40} | {master_stats['master_quiet_top1']:<24.2f}%", flush=True)
-    print(f"{'Capture Moves Top-1 Match (within caps)':<40} | {master_stats['master_cap_top1']:<24.2f}%", flush=True)
-    print(f"{'MovePicker Quiet KL Divergence':<40} | {master_stats['master_mp_kl_q']:<25.4f}", flush=True)
-    print(f"{'MovePicker Capture KL Divergence':<40} | {master_stats['master_mp_kl_c']:<25.4f}", flush=True)
-    print(f"{'Mean Top Move Search Allocation Q(i*)':<40} | {master_stats['master_q_search_star']:<24.2f}%", flush=True)
-    print(f"{'LMR Move-Order Dependent Loss':<40} | {master_stats['master_lmr_ord']:<25.4f}", flush=True)
-    print(f"{'Mean Late-Move Search Effort (E_leg)':<40} | {master_stats['master_mean_effort']:<25.4f}", flush=True)
-    print(f"{'Mean Reduction (Plies)':<40} | {master_stats['master_mean_reduction']:<25.4f}", flush=True)
-    print("=" * 80 + "\n", flush=True)
-
-    # Master Baseline On-Policy Heldout Evaluation (Cached)
-    master_heldout_stats = {}
-    if test_fens_pool:
-        master_heldout_stats = run_heldout_online_evaluation(
-            model=None, # Master Stockfish (no miniNN model)
-            test_fens=test_fens_pool,
-            target_samples=args.val_samples,
-            nodes_per_fen=args.nodes,
-            workers=args.workers,
-            session_tag="master_heldout_shared"
-        )
-        master_stats.update({f"master_{k}": v for k, v in master_heldout_stats.items()})
+    print_unified_benchmark_report("Handcrafted Stockfish Master Baseline", master_stats)
 
     if args.grid:
         grid_configs = [
@@ -1462,14 +1385,6 @@ def main():
                 "lmr_ord": 0.40,
                 "rank_profile": 0.40,
                 "output": "floored_dual_policy_lr4e3.miniNN"
-            },
-            {
-                "name": "Run2_PolicyLMR_LR2e3",
-                "lr": 2e-3,
-                "mp_anchor": 0.20,
-                "lmr_ord": 0.40,
-                "rank_profile": 0.40,
-                "output": "floored_dual_policy_lr2e3.miniNN"
             },
         ]
 
@@ -1497,27 +1412,27 @@ def main():
         print("\n" + "=" * 168, flush=True)
         print("                                            FINAL COMPARATIVE BENCHMARK TABLE (GRID EXPERIMENTS)", flush=True)
         print("=" * 168, flush=True)
-        header = f"{'Configuration':<30} | {'Heldout Top-1':<13} | {'Heldout Q-1':<11} | {'Heldout C-1':<11} | {'CPP 1 in M3':<11} | {'M1 in CPP 3':<11} | {'Top-1 Red':<9} | {'Late Red':<9} | {'Val Effort':<10} | {'Val Red':<8}"
+        header = f"{'Configuration':<30} | {'Move 1 Top-1':<13} | {'Quiet 1':<11} | {'Capture 1':<11} | {'Move1 in M3':<11} | {'M1 in Move3':<11} | {'Top-1 Red':<9} | {'Late Red':<9} | {'Val Effort':<10} | {'Val Red':<8}"
         print(header, flush=True)
         print("-" * 168, flush=True)
-        m_top1_str = f"{master_stats.get('master_heldout_top1_match', 0.0):.2f}%"
-        m_q1_str = f"{master_stats.get('master_heldout_quiet1_match', 0.0):.2f}%"
-        m_c1_str = f"{master_stats.get('master_heldout_cap1_match', 0.0):.2f}%"
-        m_cpp1_in_m3_str = f"{master_stats.get('master_heldout_cpp1_in_m3_match', 0.0):.2f}%"
-        m_m1_in_cpp3_str = f"{master_stats.get('master_heldout_m1_in_cpp3_match', 0.0):.2f}%"
-        m_r_top1_str = f"{master_stats.get('master_heldout_top1_reduction', 0.0):.2f}"
-        m_r_late_str = f"{master_stats.get('master_heldout_late_reduction', 0.0):.2f}"
-        print(f"{'Stockfish Master Baseline':<30} | {m_top1_str:>13} | {m_q1_str:>11} | {m_c1_str:>11} | {m_cpp1_in_m3_str:>11} | {m_m1_in_cpp3_str:>11} | {m_r_top1_str:>9} | {m_r_late_str:>9} | {master_stats['master_mean_effort']:>10.4f} | {master_stats['master_mean_reduction']:>8.4f}", flush=True)
+        m_top1_str = f"{master_stats.get('top1_match', 0.0):.2f}%"
+        m_q1_str = f"{master_stats.get('quiet_top1', 0.0):.2f}%"
+        m_c1_str = f"{master_stats.get('cap_top1', 0.0):.2f}%"
+        m_cpp1_in_m3_str = f"{master_stats.get('cpp1_in_m3_match', 0.0):.2f}%"
+        m_m1_in_cpp3_str = f"{master_stats.get('m1_in_cpp3_match', 0.0):.2f}%"
+        m_r_top1_str = f"{master_stats.get('top1_reduction', 0.0):.2f}"
+        m_r_late_str = f"{master_stats.get('late_reduction', 0.0):.2f}"
+        print(f"{'Stockfish Master Baseline':<30} | {m_top1_str:>13} | {m_q1_str:>11} | {m_c1_str:>11} | {m_cpp1_in_m3_str:>11} | {m_m1_in_cpp3_str:>11} | {m_r_top1_str:>9} | {m_r_late_str:>9} | {master_stats['mean_effort']:>10.4f} | {master_stats['mean_reduction']:>8.4f}", flush=True)
         print("-" * 168, flush=True)
         for name, s in results.items():
-            h_top1_str = f"{s.get('heldout_top1_match', 0.0):.2f}%"
-            h_q1_str = f"{s.get('heldout_quiet1_match', 0.0):.2f}%"
-            h_c1_str = f"{s.get('heldout_cap1_match', 0.0):.2f}%"
-            h_cpp1_in_m3_str = f"{s.get('heldout_cpp1_in_m3_match', 0.0):.2f}%"
-            h_m1_in_cpp3_str = f"{s.get('heldout_m1_in_cpp3_match', 0.0):.2f}%"
-            h_r_top1_str = f"{s.get('heldout_top1_reduction', 0.0):.2f}"
-            h_r_late_str = f"{s.get('heldout_late_reduction', 0.0):.2f}"
-            print(f"{name:<30} | {h_top1_str:>13} | {h_q1_str:>11} | {h_c1_str:>11} | {h_cpp1_in_m3_str:>11} | {h_m1_in_cpp3_str:>11} | {h_r_top1_str:>9} | {h_r_late_str:>9} | {s['mean_search_effort']:>10.4f} | {s['mean_reduction']:>8.4f}", flush=True)
+            h_top1_str = f"{s.get('heldout_top1_match', s.get('top1_match', 0.0)):.2f}%"
+            h_q1_str = f"{s.get('heldout_quiet_top1', s.get('quiet_top1', 0.0)):.2f}%"
+            h_c1_str = f"{s.get('heldout_cap_top1', s.get('cap_top1', 0.0)):.2f}%"
+            h_cpp1_in_m3_str = f"{s.get('heldout_cpp1_in_m3_match', s.get('cpp1_in_m3_match', 0.0)):.2f}%"
+            h_m1_in_cpp3_str = f"{s.get('heldout_m1_in_cpp3_match', s.get('m1_in_cpp3_match', 0.0)):.2f}%"
+            h_r_top1_str = f"{s.get('heldout_top1_reduction', s.get('top1_reduction', 0.0)):.2f}"
+            h_r_late_str = f"{s.get('heldout_late_reduction', s.get('late_reduction', 0.0)):.2f}"
+            print(f"{name:<30} | {h_top1_str:>13} | {h_q1_str:>11} | {h_c1_str:>11} | {h_cpp1_in_m3_str:>11} | {h_m1_in_cpp3_str:>11} | {h_r_top1_str:>9} | {h_r_late_str:>9} | {s['mean_effort']:>10.4f} | {s['mean_reduction']:>8.4f}", flush=True)
         print("=" * 168 + "\n", flush=True)
 
     else:
@@ -1544,12 +1459,17 @@ def main():
         print("=" * 100, flush=True)
         print(f"{'Metric':<40} | {'Trained Dual Mini-NN (V3)':<25} | {'Handcrafted Master Baseline':<25}", flush=True)
         print("-" * 100, flush=True)
-        print(f"{'MovePicker Top-1 Monty Match':<40} | {final_stats['mp_top1_acc']:<24.2f}% | {master_stats['master_mp_top1']:<24.2f}%", flush=True)
-        print(f"{'MovePicker KL Divergence Loss':<40} | {final_stats['mp_kl_loss']:<25.4f} | {master_stats['master_mp_kl']:<25.4f}", flush=True)
-        print(f"{'Mean Top Move Search Allocation Q(i*)':<40} | {final_stats['mean_q_search_star']:<24.2f}% | {master_stats['master_q_search_star']:<24.2f}%", flush=True)
-        print(f"{'LMR Policy-Weighted Loss':<40} | {final_stats['lmr_order_loss']:<25.4f} | {master_stats['master_lmr_ord']:<25.4f}", flush=True)
-        print(f"{'Mean Late-Move Search Effort':<40} | {final_stats['mean_search_effort']:<25.4f} | {master_stats['master_mean_effort']:<25.4f}", flush=True)
-        print(f"{'Mean Reduction (Plies)':<40} | {final_stats['mean_reduction']:<25.4f} | {master_stats['master_mean_reduction']:<25.4f}", flush=True)
+        print(f"{'Physical Move 1 == Monty Top-1':<40} | {final_stats['top1_match']:<24.2f}% | {master_stats['top1_match']:<24.2f}%", flush=True)
+        print(f"{'Quiet Moves Top-1 Match (within Q)':<40} | {final_stats['quiet_top1']:<24.2f}% | {master_stats['quiet_top1']:<24.2f}%", flush=True)
+        print(f"{'Capture Moves Top-1 Match (within C)':<40} | {final_stats['cap_top1']:<24.2f}% | {master_stats['cap_top1']:<24.2f}%", flush=True)
+        print(f"{'MovePicker Quiet KL Divergence':<40} | {final_stats['mp_kl_q']:<25.4f} | {master_stats['mp_kl_q']:<25.4f}", flush=True)
+        print(f"{'MovePicker Capture KL Divergence':<40} | {final_stats['mp_kl_c']:<25.4f} | {master_stats['mp_kl_c']:<25.4f}", flush=True)
+        print(f"{'Mean Top Move Search Allocation Q(i*)':<40} | {final_stats['q_search_star']:<24.2f}% | {master_stats['q_search_star']:<24.2f}%", flush=True)
+        print(f"{'LMR Policy Cross-Entropy Loss':<40} | {final_stats['lmr_policy_loss']:<25.4f} | {master_stats['lmr_policy_loss']:<25.4f}", flush=True)
+        print(f"{'Mean LMR Reduction on Monty Top-1':<40} | {final_stats['top1_reduction']:<24.2f} plies | {master_stats['top1_reduction']:<24.2f} plies", flush=True)
+        print(f"{'Mean LMR Reduction on Other Late':<40} | {final_stats['late_reduction']:<24.2f} plies | {master_stats['late_reduction']:<24.2f} plies", flush=True)
+        print(f"{'Mean Late-Move Search Effort':<40} | {final_stats['mean_effort']:<25.4f} | {master_stats['mean_effort']:<25.4f}", flush=True)
+        print(f"{'Mean Reduction (Plies)':<40} | {final_stats['mean_reduction']:<25.4f} | {master_stats['mean_reduction']:<25.4f}", flush=True)
         print("=" * 100, flush=True)
 
 
