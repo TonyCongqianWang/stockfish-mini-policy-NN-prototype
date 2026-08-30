@@ -373,8 +373,12 @@ class RolloutDataset(Dataset):
                     is_cap_mask[i] = is_capture
                     legal_mask[i] = True
 
-                    base_red = (math.log(max(1, depth)) * math.log(max(1, rank)) * 500.0) / 1024.0
-                    legacy_reduction = (math.log(max(1, depth)) * math.log(max(1, rank)) * 500.0 - stat_score * (439.0 / 4096.0)) / 1024.0
+                    if i == 0 or rank == 1:
+                        base_red = 0.0
+                        legacy_reduction = 0.0
+                    else:
+                        base_red = (math.log(max(1, depth)) * math.log(max(1, rank)) * 500.0) / 1024.0
+                        legacy_reduction = (math.log(max(1, depth)) * math.log(max(1, rank)) * 500.0 - stat_score * (439.0 / 4096.0)) / 1024.0
                     r_base[i] = base_red
                     r_legacy[i] = legacy_reduction
                     z_legacy_mp[i] = float(np.clip(stat_score / 16384.0, -1.0, 1.0))
@@ -495,6 +499,7 @@ def compute_combined_losses(
     max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
     min_red = torch.tensor(-2.0, device=delta_r_nn.device)
     r_real_nn = torch.minimum(torch.maximum(r_total_nn, min_red), max_red)
+    r_real_nn[:, 0] = 0.0  # Move 1 is searched at full depth (r = 0.00)
 
     # 4. Direct Physical Search Effort: Move 0 is searched at full depth (effort = 1.0), Moves 1..M-1 are late moves
     masked_r = r_real_nn.masked_fill(~legal_mask, 1e4)
@@ -553,7 +558,9 @@ def compute_standardized_rollout_metrics(
     acc_c = (masked_zc[has_caps].argmax(dim=-1) == p_c[has_caps].argmax(dim=-1)).float().mean() if has_caps.sum() > 0 else torch.tensor(0.0)
 
     # 2. Search Effort & Allocation
-    masked_r = r_real.masked_fill(~legal_mask, 1e4)
+    r_real_clean = r_real.clone()
+    r_real_clean[:, 0] = 0.0  # Move 1 in physical search is always full depth (r = 0.00)
+    masked_r = r_real_clean.masked_fill(~legal_mask, 1e4)
     E_late = torch.exp(-masked_r / tau_lmr) * legal_mask.float()
     E_eff = E_late.clone()
     E_eff[:, 0] = 1.0
@@ -569,15 +576,15 @@ def compute_standardized_rollout_metrics(
     top1_in_m3 = (i_star < 3).float().mean()
 
     # 4. Reductions
-    top1_red = r_real.gather(1, i_star.unsqueeze(1)).squeeze(1).mean()
+    top1_red = r_real_clean.gather(1, i_star.unsqueeze(1)).squeeze(1).mean()
     other_late_mask = legal_mask.clone()
     other_late_mask[:, 0] = False
     other_late_mask.scatter_(1, i_star.unsqueeze(1), False)
-    late_red = r_real[other_late_mask].mean() if other_late_mask.sum() > 0 else torch.tensor(0.0)
+    late_red = r_real_clean[other_late_mask].mean() if other_late_mask.sum() > 0 else torch.tensor(0.0)
 
     # 5. Monty-Weighted Late-Move Search Effort
     monty_late_effort = (target_p_lmr[:, 1:] * E_late[:, 1:]).sum(dim=-1).mean()
-    mean_red = r_real[legal_mask].mean()
+    mean_red = r_real_clean[legal_mask].mean()
 
     return {
         "top1_match": top1_match.item() * 100.0,
@@ -747,9 +754,10 @@ def evaluate_2d_depth_rank_matrix(
 
             r_total_nn = r_base + delta_r_nn
             max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
-            min_red = torch.tensor(-2.0, device=delta_r_nn.device)
             r_real_nn = torch.minimum(torch.maximum(r_total_nn, min_red), max_red)
+            r_real_nn[:, 0] = 0.0
             r_real_leg = torch.minimum(torch.maximum(r_legacy, min_red), max_red)
+            r_real_leg[:, 0] = 0.0
 
             E_nn = torch.exp(-r_real_nn / tau_lmr)
             E_leg = torch.exp(-r_real_leg / tau_lmr)
