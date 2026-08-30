@@ -1173,20 +1173,42 @@ def train_single_run(
 ) -> Dict[str, float]:
     print("\n" + "=" * 80, flush=True)
     print(f"   STARTING RUN: {run_name}", flush=True)
-    print(f"   LR = {lr:.4e} | MP Anchor = {mp_anchor_coef:.2f} | LMR Ord = {lmr_ord_coef:.2f} | Rank Profile = {rank_profile_coef:.2f} | Push Up = {push_up_coef:.3f}", flush=True)
-    print("=" * 80 + "\n", flush=True)
+    print("=" * 80, flush=True)
+    print(f"Iterations:                 {args.iterations:,}", flush=True)
+    print(f"Peak Learning Rate:         {lr:.4e}", flush=True)
+    print(f"LR Schedule:                Warmup (min 2 iters) -> Cosine Decay (Floor: {0.30 * lr:.4e})", flush=True)
+    print(f"Rollout Buffer Size:        {args.rollout_samples}", flush=True)
+    print(f"Mini-Batch Size:            {args.minibatch_size}", flush=True)
+    print(f"PPO Multi-Epochs / Iter:    {args.ppo_epochs}", flush=True)
+    print(f"MovePicker Anchor Coef:     {mp_anchor_coef:.2f}", flush=True)
+    print(f"LMR Order Coef (Detached):  {lmr_ord_coef:.2f}", flush=True)
+    print(f"Rank-Profile MSE Coef:      {rank_profile_coef:.2f}", flush=True)
+    print(f"Lean Tree Upward Push Coef: {push_up_coef:.4f}", flush=True)
+    print(f"Output Binary:              {output_path}", flush=True)
+    print("=" * 80, flush=True)
 
-    model = DualMiniNN().train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.iterations, eta_min=1e-4)
+    model = DualMiniNN()
+    model.export_quantized_binary(output_path)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    steps_per_epoch = max(1, math.ceil(args.rollout_samples / args.minibatch_size))
+    total_training_steps = args.iterations * args.ppo_epochs * steps_per_epoch
+
+    warmup_iters = min(5, max(2, args.iterations // 5))
+    warmup_steps = warmup_iters * args.ppo_epochs * steps_per_epoch
+
+    scheduler = get_onpolicy_warmup_cosine_scheduler(
+        optimizer,
+        total_steps=total_training_steps,
+        warmup_steps=warmup_steps,
+        floor_ratio=0.30
+    )
 
     curr_fen_offset = 0
     total_gradient_steps = 0
 
     for iteration in range(1, args.iterations + 1):
         t0 = time.time()
-        temp_model_path = f"/tmp/{run_name}_iter{iteration}.miniNN"
-        model.export_quantized_binary(temp_model_path)
 
         fresh_tel, fresh_db, curr_fen_offset = collect_target_samples(
             fens_pool=train_fens_pool,
@@ -1194,12 +1216,10 @@ def train_single_run(
             target_samples=args.rollout_samples,
             nodes_per_fen=args.nodes,
             sample_interval=args.sample_interval,
-            model_path=temp_model_path,
+            model_path=output_path,
             workers=args.workers,
             session_tag=f"{run_name}_iter{iteration}"
         )
-        if os.path.exists(temp_model_path):
-            os.remove(temp_model_path)
 
         train_dataset = RolloutDataset(
             telemetry_path=fresh_tel,
@@ -1211,7 +1231,9 @@ def train_single_run(
         )
         train_loader = DataLoader(train_dataset, batch_size=args.minibatch_size, shuffle=True)
 
-        iter_loss, iter_mp_kl, iter_lmr_ord, iter_steps = 0.0, 0.0, 0.0, 0
+        iter_steps = 0
+        iter_loss, iter_mp_kl, iter_lmr_ord = 0.0, 0.0, 0.0
+
         for epoch in range(args.ppo_epochs):
             for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, legal_mask, depth in train_loader:
                 optimizer.zero_grad()
@@ -1229,21 +1251,40 @@ def train_single_run(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                total_gradient_steps += 1
+                scheduler.step()
 
+                total_gradient_steps += 1
                 iter_steps += 1
                 iter_loss += loss.item()
                 iter_mp_kl += loss_mp_kl.item()
                 iter_lmr_ord += loss_lmr_ord.item()
 
-        scheduler.step()
-        try:
-            if os.path.exists(fresh_tel): os.remove(fresh_tel)
-            if os.path.exists(fresh_db): os.remove(fresh_db)
-        except Exception: pass
+                if total_gradient_steps % args.sync_interval == 0:
+                    model.export_quantized_binary(output_path)
 
-        if iteration % args.val_freq == 0 or iteration == args.iterations:
-            print(f"[{run_name} | Iter {iteration:>4d}] Loss: {iter_loss/max(1, iter_steps):.4f} (KL: {iter_mp_kl/max(1, iter_steps):.3f})", flush=True)
+        try:
+            if os.path.exists(fresh_tel):
+                os.remove(fresh_tel)
+            if os.path.exists(fresh_db):
+                os.remove(fresh_db)
+        except Exception:
+            pass
+
+        elapsed_iter = time.time() - t0
+        curr_lr = scheduler.get_last_lr()[0]
+        n_steps = max(1, iter_steps)
+
+        if iteration % args.val_freq == 0 or iteration == 1 or iteration == args.iterations:
+            val_stats = evaluate_validation_rollout(
+                model, val_loader,
+                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
+            )
+            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
+                  f"Train Loss: {iter_loss/n_steps:.4f} (MP_KL: {iter_mp_kl/n_steps:.3f}, LMR_Ord: {iter_lmr_ord/n_steps:.3f}) | "
+                  f"Val MP Top-1: {val_stats['mp_top1_acc']:5.2f}% | Val Search Alloc Q(i*): {val_stats['mean_q_search_star']:5.2f}% | Effort: {val_stats['mean_search_effort']:.3f} | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
+        else:
+            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
+                  f"Train Loss: {iter_loss/n_steps:.4f} (MP_KL: {iter_mp_kl/n_steps:.3f}, LMR_Ord: {iter_lmr_ord/n_steps:.3f})", flush=True)
 
     final_stats = evaluate_validation_rollout(
         model, val_loader,
