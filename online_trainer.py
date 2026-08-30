@@ -348,6 +348,7 @@ class RolloutDataset(Dataset):
                 r_legacy = torch.zeros(MAX_LEGAL_MOVES, dtype=torch.float32)
                 z_legacy_mp = torch.zeros(MAX_LEGAL_MOVES, dtype=torch.float32)
                 target_p_mp = torch.zeros(MAX_LEGAL_MOVES, dtype=torch.float32)
+                target_p_lmr = torch.zeros(MAX_LEGAL_MOVES, dtype=torch.float32)
 
                 m_policy = policies.get(fen, {})
 
@@ -1100,13 +1101,14 @@ def run_heldout_online_evaluation(
             merge_worker_dbs(db_path, worker_db_paths)
 
     # 3. Load heldout rollout dataset and evaluate standardized metrics
+    t_lmr_calib, t_mp_calib, floor_lmr_calib, floor_mp_calib = load_calibration_parameters()
     heldout_dataset = RolloutDataset(
         telemetry_path=tel_path,
         monty_db_path=db_path,
-        floor_lmr=0.010,
-        floor_mp=0.010,
-        t_lmr=0.8658,
-        t_mp=0.1154
+        floor_lmr=floor_lmr_calib,
+        floor_mp=floor_mp_calib,
+        t_lmr=t_lmr_calib,
+        t_mp=t_mp_calib
     )
     heldout_loader = DataLoader(heldout_dataset, batch_size=256, shuffle=False)
 
