@@ -754,6 +754,7 @@ def evaluate_2d_depth_rank_matrix(
 
             r_total_nn = r_base + delta_r_nn
             max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
+            min_red = torch.tensor(-2.0, device=delta_r_nn.device)
             r_real_nn = torch.minimum(torch.maximum(r_total_nn, min_red), max_red)
             r_real_nn[:, 0] = 0.0
             r_real_leg = torch.minimum(torch.maximum(r_legacy, min_red), max_red)
