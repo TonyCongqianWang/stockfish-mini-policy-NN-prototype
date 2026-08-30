@@ -1,0 +1,7 @@
+{
+    "stockfish_bin": "Stockfish/src/stockfish",
+    "monty_bin": "tools/Monty/monty",
+    "epd_file": "scratch/popular_ajedrezdata_maxPlies60.epd.scored",
+    "cache_dir": "scratch",
+    "calibration_config": "tools/stockfish-mini-policy-NN-prototype/calibration_config.json"
+}
