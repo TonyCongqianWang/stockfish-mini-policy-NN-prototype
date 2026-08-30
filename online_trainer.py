@@ -992,7 +992,7 @@ def run_heldout_online_evaluation(
 ) -> Dict[str, float]:
     tag_name = "NEURAL MININN" if model is not None else "HANDCRAFTED STOCKFISH MASTER"
     print("\n" + "=" * 80, flush=True)
-    print(f"   {tag_name} - HELDOUT ON-POLICY EVALUATION ({target_samples:,} SAMPLES)", flush=True)
+    print(f"   {tag_name} - HELDOUT ON-POLICY EVALUATION ({len(test_fens):,} TEST FENs)", flush=True)
     print("=" * 80, flush=True)
 
     temp_model_path = ""
@@ -1030,9 +1030,8 @@ def run_heldout_online_evaluation(
                         all_lines.append(line)
             os.remove(p)
 
-    selected_lines = all_lines[:target_samples] if len(all_lines) >= target_samples else all_lines
     with open(tel_path, "w") as out_f:
-        for line in selected_lines:
+        for line in all_lines:
             out_f.write(line)
 
     # 2. Extract unique FENs from tel_path and query Monty on them
