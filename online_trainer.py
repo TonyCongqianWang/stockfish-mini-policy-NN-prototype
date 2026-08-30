@@ -61,14 +61,14 @@ def load_calibration_parameters() -> Tuple[float, float, float, float]:
         try:
             with open(CALIB_CONFIG_PATH, "r") as f:
                 cfg = json.load(f)
-            t_lmr = float(cfg.get("t_calib_lmr", 0.8658))
-            t_mp = float(cfg.get("t_calib_mp", 0.1154))
-            floor_lmr = float(cfg.get("chosen_floor_lmr", 0.010))
+            t_lmr = float(cfg.get("t_calib_lmr", 1.5))
+            t_mp = float(cfg.get("t_calib_mp", 0.5))
+            floor_lmr = float(cfg.get("chosen_floor_lmr", 0.10))
             floor_mp = float(cfg.get("chosen_floor_mp", 0.010))
             return t_lmr, t_mp, floor_lmr, floor_mp
         except Exception:
             pass
-    return 0.8658, 0.1154, 0.010, 0.010
+    return 1.5, 0.5, 0.10, 0.010
 
 
 def load_and_subsample_fens(
@@ -383,14 +383,22 @@ class RolloutDataset(Dataset):
 
                 if raw_p_list:
                     p_arr = np.array(raw_p_list, dtype=np.float64)
-                    p_mp_f = np.maximum(p_arr, self.floor_mp)
-                    p_mp_norm = p_mp_f / np.sum(p_mp_f)
-                    log_mp = np.log(p_mp_norm + 1e-12) / self.t_mp
+                    # 1. MovePicker Target (T_mp = 0.5, q_mp = 0.01)
+                    log_mp = np.log(p_arr + 1e-12) / self.t_mp
                     exp_mp = np.exp(log_mp - np.max(log_mp))
-                    target_p_mp[:num_moves] = torch.from_numpy(exp_mp / np.sum(exp_mp)).float()
+                    p_temp_mp = exp_mp / np.sum(exp_mp)
+                    p_target_mp = (1.0 - self.floor_mp) * p_temp_mp + self.floor_mp / float(num_moves)
+                    target_p_mp[:num_moves] = torch.from_numpy(p_target_mp).float()
+
+                    # 2. LMR Target (T_lmr = 1.5, q_lmr = 0.10)
+                    log_lmr = np.log(p_arr + 1e-12) / self.t_lmr
+                    exp_lmr = np.exp(log_lmr - np.max(log_lmr))
+                    p_temp_lmr = exp_lmr / np.sum(exp_lmr)
+                    p_target_lmr = (1.0 - self.floor_lmr) * p_temp_lmr + self.floor_lmr / float(num_moves)
+                    target_p_lmr[:num_moves] = torch.from_numpy(p_target_lmr).float()
 
                 depth_tensor = torch.tensor(float(depth), dtype=torch.float32)
-                self.items.append((u_node, x_quiet, x_cap, x_lmr, is_cap_mask, r_base, r_legacy, z_legacy_mp, target_p_mp, legal_mask, depth_tensor))
+                self.items.append((u_node, x_quiet, x_cap, x_lmr, is_cap_mask, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth_tensor))
 
     def __len__(self):
         return len(self.items)
@@ -406,6 +414,7 @@ def compute_combined_losses(
     tau_mp: torch.Tensor,
     tau_lmr: torch.Tensor,
     target_p_mp: torch.Tensor,
+    target_p_lmr: torch.Tensor,
     z_legacy_mp: torch.Tensor,
     r_base: torch.Tensor,
     r_legacy: torch.Tensor,
@@ -419,14 +428,14 @@ def compute_combined_losses(
     """
     Computes Direct Physical Search Allocation and Independent Quiet/Capture MovePicker Losses:
     1. MovePicker:
-       - Quiets: Monty KL divergence + Shape Loss on quiet moves using z_quiet.
-       - Captures: Monty KL divergence + Shape Loss on capture moves using z_cap.
+       - Quiets: Monty KL divergence + Shape Loss on quiet moves using z_quiet vs target_p_mp.
+       - Captures: Monty KL divergence + Shape Loss on capture moves using z_cap vs target_p_mp.
     2. Direct Physical Search Allocation (Monty Policy-Weighted KL Divergence):
        - Move 0: Searched at full depth (Effort = 1.00).
        - Moves 1..M-1: Searched with late reductions r_real = clamp(r_base + delta_r_nn, -2.0, depth - 1.0).
        - Full Policy Search Effort Distribution Q(j) = E_eff(j) / sum(E_eff).
-       - Loss = -sum_j p_monty(j) * log Q(j).
-    3. LMR Profile MSE: Anchored to Master's baseline reduction profile.
+       - Loss = -sum_j target_p_lmr(j) * log Q(j).
+    3. LMR Profile MSE: Anchored directly on physical delta_r_nn residual.
     """
     B, M = z_quiet.shape
     i_star = target_p_mp.argmax(dim=-1)
@@ -485,7 +494,6 @@ def compute_combined_losses(
     max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
     min_red = torch.tensor(-2.0, device=delta_r_nn.device)
     r_real_nn = torch.minimum(torch.maximum(r_total_nn, min_red), max_red)
-    r_real_leg = torch.minimum(torch.maximum(r_legacy, min_red), max_red)
 
     # 4. Direct Physical Search Effort: Move 0 is searched at full depth (effort = 1.0), Moves 1..M-1 are late moves
     masked_r = r_real_nn.masked_fill(~legal_mask, 1e4)
@@ -495,32 +503,10 @@ def compute_combined_losses(
 
     D = E_eff.sum(dim=-1, keepdim=True)
     Q_dist = E_eff / (D + 1e-12)
-    loss_lmr_order = (w_depth * -(target_p_mp * torch.log(Q_dist + 1e-12)).sum(dim=-1)).mean()
+    loss_lmr_order = (w_depth * -(target_p_lmr * torch.log(Q_dist + 1e-12)).sum(dim=-1)).mean()
 
-    # 5. Rank Profile MSE (Anchored to Master's baseline reduction profile)
-    sorted_r_nn, _ = torch.sort(r_real_nn.masked_fill(~legal_mask, 1e4), dim=-1)
-    sorted_r_leg, _ = torch.sort(r_real_leg.masked_fill(~legal_mask, 1e4), dim=-1)
-
-    loss_rank_profile = torch.tensor(0.0, device=delta_r_nn.device)
-    valid_ranks = 0
-    for k in range(1, min(M, 4)):
-        mask_k = (legal_mask.sum(dim=-1) > k)
-        if mask_k.sum() > 0:
-            e_nn_k = torch.exp(-sorted_r_nn[mask_k, k] / tau_lmr).mean()
-            e_leg_k = torch.exp(-sorted_r_leg[mask_k, k] / tau_lmr).mean()
-            loss_rank_profile = loss_rank_profile + (torch.log(e_nn_k + 1e-6) - torch.log(e_leg_k + 1e-6)).pow(2)
-            valid_ranks += 1
-
-    num_legal = legal_mask.sum(dim=-1, keepdim=True)
-    rank_indices = torch.arange(M, device=delta_r_nn.device).unsqueeze(0).expand(B, M)
-    tail_mask = (rank_indices >= 4) & (rank_indices < num_legal)
-    if tail_mask.sum() > 0:
-        e_nn_tail = torch.exp(-sorted_r_nn[tail_mask] / tau_lmr).mean()
-        e_leg_tail = torch.exp(-sorted_r_leg[tail_mask] / tau_lmr).mean()
-        loss_rank_profile = loss_rank_profile + (torch.log(e_nn_tail + 1e-6) - torch.log(e_leg_tail + 1e-6)).pow(2)
-        valid_ranks += 1
-
-    loss_rank_profile = loss_rank_profile / max(1, valid_ranks)
+    # 5. Direct Physical Rank Profile MSE (Anchored to Master's baseline reduction profile)
+    loss_rank_profile = (w_depth * (delta_r_nn ** 2) * legal_mask.float()).sum() / legal_mask.sum()
 
     loss_lmr_total = lmr_ord_coef * loss_lmr_order + rank_profile_coef * loss_rank_profile
     loss_total = loss_mp_total + loss_lmr_total
@@ -530,7 +516,8 @@ def compute_combined_losses(
 
 
 def compute_standardized_rollout_metrics(
-    p_target: torch.Tensor,
+    target_p_mp: torch.Tensor,
+    target_p_lmr: torch.Tensor,
     r_real: torch.Tensor,
     z_q: torch.Tensor,
     z_c: torch.Tensor,
@@ -542,14 +529,14 @@ def compute_standardized_rollout_metrics(
     """
     Standardized, canonical metric calculation across all evaluation streams.
     """
-    B, M = p_target.shape
-    i_star = p_target.argmax(dim=-1)
+    B, M = target_p_mp.shape
+    i_star = target_p_mp.argmax(dim=-1)
 
     # 1. MovePicker Sub-Distributions (Filtered >= 5% mass)
     quiet_mask = legal_mask & (~is_cap)
     masked_zq = z_q.masked_fill(~quiet_mask, -1e4)
     log_probs_q = F.log_softmax(masked_zq / tau_mp, dim=-1)
-    p_q = p_target * quiet_mask.float()
+    p_q = target_p_mp * quiet_mask.float()
     w_q_pos = p_q.sum(dim=-1)
     has_quiets = (w_q_pos >= 0.05) & (quiet_mask.sum(dim=-1) > 1)
     mp_kl_q = -(p_q[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1).mean() if has_quiets.sum() > 0 else torch.tensor(0.0)
@@ -558,7 +545,7 @@ def compute_standardized_rollout_metrics(
     cap_mask = legal_mask & is_cap
     masked_zc = z_c.masked_fill(~cap_mask, -1e4)
     log_probs_c = F.log_softmax(masked_zc / tau_mp, dim=-1)
-    p_c = p_target * cap_mask.float()
+    p_c = target_p_mp * cap_mask.float()
     w_c_pos = p_c.sum(dim=-1)
     has_caps = (w_c_pos >= 0.05) & (cap_mask.sum(dim=-1) > 1)
     mp_kl_c = -(p_c[has_caps] * log_probs_c[has_caps]).sum(dim=-1).mean() if has_caps.sum() > 0 else torch.tensor(0.0)
@@ -571,12 +558,12 @@ def compute_standardized_rollout_metrics(
     E_eff[:, 0] = 1.0
     D = E_eff.sum(dim=-1, keepdim=True)
     Q_dist = E_eff / (D + 1e-12)
-    lmr_policy_loss = -(p_target * torch.log(Q_dist + 1e-12)).sum(dim=-1).mean()
+    lmr_policy_loss = -(target_p_lmr * torch.log(Q_dist + 1e-12)).sum(dim=-1).mean()
     q_star = Q_dist.gather(1, i_star.unsqueeze(1)).squeeze(1).mean()
 
     # 3. Physical Ordering & Top-1 Metrics
     top1_match = (i_star == 0).float().mean()
-    sorted_p = p_target.argsort(dim=-1, descending=True)
+    sorted_p = target_p_mp.argsort(dim=-1, descending=True)
     m1_in_top3 = (sorted_p[:, :3] == 0).any(dim=-1).float().mean()
     top1_in_m3 = (i_star < 3).float().mean()
 
@@ -587,7 +574,8 @@ def compute_standardized_rollout_metrics(
     other_late_mask.scatter_(1, i_star.unsqueeze(1), False)
     late_red = r_real[other_late_mask].mean() if other_late_mask.sum() > 0 else torch.tensor(0.0)
 
-    mean_effort = (E_late[:, 1:]).sum(dim=-1).mean()
+    # 5. Monty-Weighted Late-Move Search Effort
+    monty_late_effort = (target_p_lmr[:, 1:] * E_late[:, 1:]).sum(dim=-1).mean()
     mean_red = r_real[legal_mask].mean()
 
     return {
@@ -603,7 +591,7 @@ def compute_standardized_rollout_metrics(
         "lmr_policy_loss": lmr_policy_loss.item(),
         "top1_reduction": top1_red.item(),
         "late_reduction": late_red.item(),
-        "mean_effort": mean_effort.item(),
+        "mean_effort": monty_late_effort.item(),
         "mean_reduction": mean_red.item()
     }
 
@@ -623,21 +611,21 @@ def print_unified_benchmark_report(title: str, stats: Dict[str, float]):
     print(f"{'LMR Policy Cross-Entropy Loss:':<45} {stats.get('lmr_policy_loss', 0.0):.4f}", flush=True)
     print(f"{'Mean LMR Reduction on Monty Top-1 Move:':<45} {stats.get('top1_reduction', 0.0):.2f} plies", flush=True)
     print(f"{'Mean LMR Reduction on Other Late Moves:':<45} {stats.get('late_reduction', 0.0):.2f} plies", flush=True)
-    print(f"{'Mean Late-Move Search Effort (E):':<45} {stats.get('mean_effort', 0.0):.4f}", flush=True)
+    print(f"{'Monty-Weighted Late Search Effort (E):':<45} {stats.get('mean_effort', 0.0):.4f}", flush=True)
     print(f"{'Mean Total Reduction:':<45} {stats.get('mean_reduction', 0.0):.4f} plies", flush=True)
     print("=" * 80 + "\n", flush=True)
 
 
 def evaluate_handcrafted_master(
     loader: DataLoader,
-    tau_mp: float = 0.1154,
-    tau_lmr: float = 0.8658
+    tau_mp: float = 0.5,
+    tau_lmr: float = 1.5
 ) -> Dict[str, float]:
     stat_sums = {}
     total_count = 0
 
     with torch.no_grad():
-        for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, legal_mask, depth in loader:
+        for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in loader:
             B, M = z_legacy_mp.shape
             max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
             min_red = torch.tensor(-2.0, device=r_legacy.device)
@@ -647,7 +635,8 @@ def evaluate_handcrafted_master(
             tau_lmr_t = torch.tensor(tau_lmr, device=z_legacy_mp.device)
 
             b_stats = compute_standardized_rollout_metrics(
-                p_target=target_p_mp,
+                target_p_mp=target_p_mp,
+                target_p_lmr=target_p_lmr,
                 r_real=r_real_leg,
                 z_q=z_legacy_mp,
                 z_c=z_legacy_mp,
@@ -671,7 +660,7 @@ def evaluate_validation_rollout(
     mp_anchor_coef: float = 0.20,
     lmr_ord_coef: float = 0.40,
     rank_profile_coef: float = 0.40,
-    tau_lmr: float = 0.8658
+    tau_lmr: float = 1.5
 ) -> Dict[str, float]:
     model.eval()
     tot_loss_sum, mp_anc_sum, rank_prof_loss_sum = 0.0, 0.0, 0.0
@@ -679,14 +668,14 @@ def evaluate_validation_rollout(
     total_count = 0
 
     with torch.no_grad():
-        for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, legal_mask, depth in loader:
+        for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in loader:
             w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, cap_scores, delta_r_nn = model(u_node, x_quiet, x_cap, x_lmr)
 
             z_quiet = quiet_scores / 32768.0
             z_cap = cap_scores / 32768.0
 
             loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, acc_q, acc_c, mean_q_star = compute_combined_losses(
-                z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
+                z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
                 mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
             )
 
@@ -696,7 +685,8 @@ def evaluate_validation_rollout(
             r_real_nn = torch.minimum(torch.maximum(r_total_nn, min_red), max_red)
 
             b_stats = compute_standardized_rollout_metrics(
-                p_target=target_p_mp,
+                target_p_mp=target_p_mp,
+                target_p_lmr=target_p_lmr,
                 r_real=r_real_nn,
                 z_q=z_quiet,
                 z_c=z_cap,
@@ -727,12 +717,13 @@ def evaluate_validation_rollout(
 def evaluate_2d_depth_rank_matrix(
     model: nn.Module,
     loader: DataLoader,
-    tau_lmr: float = 0.8658
+    tau_lmr: float = 1.5
 ):
     """
     Computes a comprehensive 2D Matrix of late-move reductions and search efforts:
     - 3 Depth Bands: Low (d: 2-6), Mid (d: 7-12), Deep (d: 13+)
     - 4 Late-Move Buckets: Move 2, Move 3, Move 4, Moves 5+ (Tail)
+    Uses direct physical move rank column indexing.
     """
     model.eval()
     bands = [
@@ -750,7 +741,7 @@ def evaluate_2d_depth_rank_matrix(
     }
 
     with torch.no_grad():
-        for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, legal_mask, depth in loader:
+        for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in loader:
             w_quiet, z_latents, tau_mp, t_lmr_pred, quiet_scores, cap_scores, delta_r_nn = model(u_node, x_quiet, x_cap, x_lmr)
 
             r_total_nn = r_base + delta_r_nn
@@ -761,12 +752,6 @@ def evaluate_2d_depth_rank_matrix(
 
             E_nn = torch.exp(-r_real_nn / tau_lmr)
             E_leg = torch.exp(-r_real_leg / tau_lmr)
-
-            sorted_r_nn, _ = torch.sort(r_real_nn.masked_fill(~legal_mask, 1e4), dim=-1)
-            sorted_r_leg, _ = torch.sort(r_real_leg.masked_fill(~legal_mask, 1e4), dim=-1)
-
-            sorted_e_nn, _ = torch.sort(E_nn.masked_fill(~legal_mask, 0.0), dim=-1, descending=True)
-            sorted_e_leg, _ = torch.sort(E_leg.masked_fill(~legal_mask, 0.0), dim=-1, descending=True)
 
             B = depth.size(0)
             for b in range(B):
@@ -785,26 +770,21 @@ def evaluate_2d_depth_rank_matrix(
 
                 b_stats = stats[band_name]
 
-                # Moves 2, 3, 4 (Late Moves: sorted ranks k = 1, 2, 3 -> index 0, 1, 2)
+                # Moves 2, 3, 4 (Physical Move Ranks: column indices k = 1, 2, 3)
                 for k in range(1, 4):
                     if num_m > k:
-                        b_stats["nn_red"][k-1] += sorted_r_nn[b, k].item()
-                        b_stats["nn_eff"][k-1] += sorted_e_nn[b, k].item()
-                        b_stats["leg_red"][k-1] += sorted_r_leg[b, k].item()
-                        b_stats["leg_eff"][k-1] += sorted_e_leg[b, k].item()
+                        b_stats["nn_red"][k-1] += r_real_nn[b, k].item()
+                        b_stats["nn_eff"][k-1] += E_nn[b, k].item()
+                        b_stats["leg_red"][k-1] += r_real_leg[b, k].item()
+                        b_stats["leg_eff"][k-1] += E_leg[b, k].item()
                         b_stats["counts"][k-1] += 1
 
-                # Move 5+ (Tail Bucket: sorted ranks k >= 4 -> index 3)
+                # Move 5+ (Tail Bucket: column indices k >= 4)
                 if num_m > 4:
-                    tail_nn_r = sorted_r_nn[b, 4:num_m].mean().item()
-                    tail_nn_e = sorted_e_nn[b, 4:num_m].mean().item()
-                    tail_leg_r = sorted_r_leg[b, 4:num_m].mean().item()
-                    tail_leg_e = sorted_e_leg[b, 4:num_m].mean().item()
-
-                    b_stats["nn_red"][3] += tail_nn_r
-                    b_stats["nn_eff"][3] += tail_nn_e
-                    b_stats["leg_red"][3] += tail_leg_r
-                    b_stats["leg_eff"][3] += tail_leg_e
+                    b_stats["nn_red"][3] += r_real_nn[b, 4:num_m].mean().item()
+                    b_stats["nn_eff"][3] += E_nn[b, 4:num_m].mean().item()
+                    b_stats["leg_red"][3] += r_real_leg[b, 4:num_m].mean().item()
+                    b_stats["leg_eff"][3] += E_leg[b, 4:num_m].mean().item()
                     b_stats["counts"][3] += 1
 
     print("\n" + "=" * 105, flush=True)
@@ -1223,7 +1203,7 @@ def train_single_run(
         iter_loss, iter_mp_kl_q, iter_mp_kl_c, iter_lmr_ord = 0.0, 0.0, 0.0, 0.0
 
         for epoch in range(args.ppo_epochs):
-            for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, legal_mask, depth in train_loader:
+            for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in train_loader:
                 optimizer.zero_grad()
                 w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, cap_scores, delta_r_nn = model(u_node, x_quiet, x_cap, x_lmr)
 
@@ -1231,7 +1211,7 @@ def train_single_run(
                 z_cap = cap_scores / 32768.0
 
                 loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, _, _, _ = compute_combined_losses(
-                    z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
+                    z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
                     mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
                 )
 
@@ -1466,8 +1446,7 @@ def main():
         print(f"{'Mean Top Move Search Allocation Q(i*)':<40} | {final_stats['q_search_star']:<24.2f}% | {master_stats['q_search_star']:<24.2f}%", flush=True)
         print(f"{'LMR Policy Cross-Entropy Loss':<40} | {final_stats['lmr_policy_loss']:<25.4f} | {master_stats['lmr_policy_loss']:<25.4f}", flush=True)
         print(f"{'Mean LMR Reduction on Monty Top-1':<40} | {final_stats['top1_reduction']:<24.2f} plies | {master_stats['top1_reduction']:<24.2f} plies", flush=True)
-        print(f"{'Mean LMR Reduction on Other Late':<40} | {final_stats['late_reduction']:<24.2f} plies | {master_stats['late_reduction']:<24.2f} plies", flush=True)
-        print(f"{'Mean Late-Move Search Effort':<40} | {final_stats['mean_effort']:<25.4f} | {master_stats['mean_effort']:<25.4f}", flush=True)
+        print(f"{'Monty-Weighted Late Search Effort':<40} | {final_stats['mean_effort']:<25.4f} | {master_stats['mean_effort']:<25.4f}", flush=True)
         print(f"{'Mean Reduction (Plies)':<40} | {final_stats['mean_reduction']:<25.4f} | {master_stats['mean_reduction']:<25.4f}", flush=True)
         print("=" * 100, flush=True)
 
