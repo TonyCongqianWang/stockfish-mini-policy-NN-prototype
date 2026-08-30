@@ -62,6 +62,54 @@ def extract_node_features(
     return torch.from_numpy(features)
 
 
+PIECE_VALS = {1: 100, 2: 300, 3: 300, 4: 500, 5: 900, 6: 0}
+
+
+def extract_quiet_features_from_data(m_data: dict, ply: int = 16) -> torch.Tensor:
+    x = np.zeros(12, dtype=np.float32)
+    x[0] = np.clip(m_data.get("main_hist", 0) / 16384.0, -1.0, 1.0)
+    x[1] = np.clip(m_data.get("pawn_hist", 0) / 16384.0, -1.0, 1.0)
+    ch = m_data.get("cont_hist", [0, 0, 0, 0, 0])
+    for idx, c_val in enumerate(ch[:5]):
+        x[2 + idx] = np.clip(c_val / 16384.0, -1.0, 1.0)
+    x[7] = 1.0 if m_data.get("gives_check", False) else -1.0
+    x[8] = 1.0 if m_data.get("threat_from", False) else -1.0
+    x[9] = 1.0 if m_data.get("threat_to", False) else -1.0
+    moved_pt = m_data.get("moved_pt", 1)
+    x[10] = np.clip((moved_pt - 2.0) / 2.0, -1.0, 1.0)
+    low_ply = m_data.get("low_ply_hist", 0)
+    x[11] = np.clip((low_ply / (1 + ply)) / 16384.0, -1.0, 1.0)
+    return torch.from_numpy(x)
+
+
+def extract_capture_features_from_data(m_data: dict) -> torch.Tensor:
+    x = np.zeros(4, dtype=np.float32)
+    x[0] = np.clip(m_data.get("capt_hist", 0) / 16384.0, -1.0, 1.0)
+    cap_val = PIECE_VALS.get(m_data.get("captured_pt", 0), 100)
+    moved_val = PIECE_VALS.get(m_data.get("moved_pt", 1), 100)
+    x[1] = np.clip(cap_val / 500.0, 0.0, 1.0)
+    x[2] = np.clip((cap_val - moved_val) / 500.0, -1.0, 1.0)
+    x[3] = 1.0 if m_data.get("gives_check", False) else -1.0
+    return torch.from_numpy(x)
+
+
+def extract_lmr_features_from_data(m_data: dict, tt_pv: bool = False) -> torch.Tensor:
+    x = np.zeros(8, dtype=np.float32)
+    x[0] = np.clip(m_data.get("stat_score", 0) / 2000.0, -1.0, 1.0)
+    rank = m_data.get("picker_rank", 1)
+    x[1] = np.clip((rank - 4.0) / 8.0, -1.0, 1.0)
+    is_cap = m_data.get("is_capture", False)
+    x[2] = 1.0 if is_cap else -1.0
+    cap_val = PIECE_VALS.get(m_data.get("captured_pt", 0), 100) if is_cap else 0
+    x[3] = np.clip(cap_val / 500.0, 0.0, 1.0) if is_cap else 0.0
+    x[4] = 1.0 if m_data.get("gives_check", False) else -1.0
+    x[5] = 1.0 if m_data.get("is_promotion", False) else -1.0
+    moved_pt = m_data.get("moved_pt", 1)
+    x[6] = np.clip((moved_pt - 2.0) / 2.0, -1.0, 1.0)
+    x[7] = 1.0 if tt_pv else -1.0
+    return torch.from_numpy(x)
+
+
 def extract_quiet_features(
     board: chess.Board,
     move: chess.Move,

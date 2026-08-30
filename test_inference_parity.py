@@ -64,13 +64,14 @@ def simulate_cpp_fixed_point_v3(model_path: str, u_node, x_quiet, x_cap_raw, x_l
     # 2. Quiet Move Forward Pass
     xq_q = np.clip(np.round(x_quiet * 64.0), -127, 127).astype(np.int32)
     hq = np.clip((quiet_b0 + quiet_w0 @ xq_q + 32) >> 6, 0, 127)
-    score_quiet_raw = (np.sum(hq * w_quiet_cpp) * 1200 + 4064) // (64 * 127)
-    score_quiet_cpp = np.clip(score_quiet_raw, -1200, 1200)
+    score_quiet_raw = (np.sum(hq * w_quiet_cpp) * 512 + 63) // 127
+    score_quiet_cpp = np.clip(score_quiet_raw, -32768, 32767)
 
     # 3. Capture Move Forward Pass
     xcap_q = np.concatenate([np.clip(np.round(x_cap_raw * 64.0), -127, 127).astype(np.int32), z_latents_cpp])
     hcap = np.clip((cap_b0 + cap_w0 @ xcap_q + 32) >> 6, 0, 127)
-    score_cap_cpp = np.clip(((cap_b1[0] + np.sum(cap_w1[0] * hcap)) * 1200 + 2048) >> 12, -1200, 1200)
+    score_cap_raw = (cap_b1[0] + np.sum(cap_w1[0] * hcap)) * 8
+    score_cap_cpp = np.clip(score_cap_raw, -32768, 32767)
 
     # 4. LMR Forward Pass
     xlmr_q = np.concatenate([np.clip(np.round(x_lmr_raw * 64.0), -127, 127).astype(np.int32), z_latents_cpp])
@@ -170,13 +171,13 @@ def test_parity():
     print("-" * 80)
     print(f"{'Node Net: w_quiet Meta-Weights':<35} | {mean_wq_diff:<25.3f} (scale 127) | {np.max(w_quiet_diffs):<15.1f}")
     print(f"{'Node Net: z_latents State Vector':<35} | {mean_zlat_diff:<25.3f} (scale 64)  | {np.max(z_latent_diffs):<15.1f}")
-    print(f"{'Quiet Move Score (score_quiet)':<35} | {mean_quiet_diff:<25.2f} (scale 1200)| {max_quiet_diff:<15.1f}")
-    print(f"{'Capture Move Score (score_capture)':<35} | {mean_cap_diff:<25.2f} (scale 1200)| {max_cap_diff:<15.1f}")
+    print(f"{'Quiet Move Score (score_quiet)':<35} | {mean_quiet_diff:<25.2f} (scale 32768)| {max_quiet_diff:<15.1f}")
+    print(f"{'Capture Move Score (score_capture)':<35} | {mean_cap_diff:<25.2f} (scale 32768)| {max_cap_diff:<15.1f}")
     print(f"{'LMR Reduction (evaluate_lmr)':<35} | {mean_lmr_diff:<25.2f} (scale 1024)| {max_lmr_diff:<15.1f}")
     print("=" * 80)
 
-    assert mean_quiet_diff < 5.0, f"Quiet move score disparity too high: {mean_quiet_diff}"
-    assert mean_cap_diff < 5.0, f"Capture move score disparity too high: {mean_cap_diff}"
+    assert mean_quiet_diff < 50.0, f"Quiet move score disparity too high: {mean_quiet_diff}"
+    assert mean_cap_diff < 50.0, f"Capture move score disparity too high: {mean_cap_diff}"
     assert mean_lmr_diff < 15.0, f"LMR reduction disparity too high: {mean_lmr_diff}"
 
     print(f"ALL PARITY TESTS PASSED! LMR MAE is {mean_lmr_diff/1024:.5f} plies (sub-0.01 plies).\n")

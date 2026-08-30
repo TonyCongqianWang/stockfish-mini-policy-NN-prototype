@@ -43,10 +43,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from dataset import (
     MAX_LEGAL_MOVES,
+    extract_capture_features_from_data,
     extract_capture_raw_features,
+    extract_lmr_features_from_data,
     extract_lmr_raw_features,
     extract_node_features,
     extract_quiet_features,
+    extract_quiet_features_from_data,
 )
 from model import DualMiniNN
 from paths import CACHE_DIR, CALIB_CONFIG_PATH, EPD_FILE, MONTY_BIN, STOCKFISH_BIN
@@ -71,9 +74,10 @@ def load_and_subsample_fens(
     epd_path: str,
     stream_limit: int = 500_000,
     val_count: int = 1_000,
+    test_count: int = 1_000,
     train_count: int = 100_000,
     seed: int = 42
-) -> Tuple[List[str], List[str]]:
+) -> Tuple[List[str], List[str], List[str]]:
     print(f"Streaming up to {stream_limit:,} FENs from {epd_path}...", flush=True)
     all_fens = []
     with open(epd_path, "r") as f:
@@ -90,9 +94,10 @@ def load_and_subsample_fens(
     rng.shuffle(all_fens)
 
     val_fens = all_fens[:val_count]
-    train_fens = all_fens[val_count : val_count + train_count]
-    print(f"Selected {len(val_fens):,} validation FENs and {len(train_fens):,} training FENs.\n", flush=True)
-    return val_fens, train_fens
+    test_fens = all_fens[val_count : val_count + test_count]
+    train_fens = all_fens[val_count + test_count : val_count + test_count + train_count]
+    print(f"Selected {len(val_fens):,} validation FENs, {len(test_fens):,} held-out test FENs, and {len(train_fens):,} training FENs.\n", flush=True)
+    return val_fens, test_fens, train_fens
 
 
 def get_onpolicy_warmup_cosine_scheduler(
@@ -314,13 +319,17 @@ class RolloutDataset(Dataset):
                     continue
 
                 # Depth-Independent Node Features (with cut_node and pv_node)
+                prev_stat_score = s.get("prev_stat_score", 0)
+                cutoff_cnt = s.get("cutoff_cnt", 1)
                 u_node = extract_node_features(
                     board,
                     ply=ply,
                     improving=improving,
                     cut_node=cut_node,
                     pv_node=pv_node,
-                    static_eval=static_eval
+                    static_eval=static_eval,
+                    prev_stat_score=prev_stat_score,
+                    cutoff_cnt=cutoff_cnt
                 )
 
                 num_moves = min(len(moves_info), MAX_LEGAL_MOVES)
@@ -345,21 +354,23 @@ class RolloutDataset(Dataset):
                     uci_str = m_data["move"]
                     stat_score = m_data.get("stat_score", 0)
                     is_capture = m_data.get("is_capture", False)
+                    rank = m_data.get("picker_rank", i + 1)
 
                     try:
+                        x_quiet[i] = extract_quiet_features_from_data(m_data, ply=ply)
+                        x_cap[i] = extract_capture_features_from_data(m_data)
+                        x_lmr[i] = extract_lmr_features_from_data(m_data)
+                    except Exception:
                         move_obj = chess.Move.from_uci(uci_str)
                         x_quiet[i] = extract_quiet_features(board, move_obj, stat_score=stat_score, ply=ply)
                         x_cap[i] = extract_capture_raw_features(board, move_obj, stat_score=stat_score)
-                        # Depth-Independent LMR Move Features
-                        x_lmr[i] = extract_lmr_raw_features(board, move_obj, stat_score=stat_score, rank=i)
-                    except Exception:
-                        pass
+                        x_lmr[i] = extract_lmr_raw_features(board, move_obj, stat_score=stat_score, rank=rank)
 
                     is_cap_mask[i] = is_capture
                     legal_mask[i] = True
 
-                    base_red = (math.log(max(1, depth)) * math.log(max(1, i + 1)) * 500.0) / 1024.0
-                    legacy_reduction = (math.log(max(1, depth)) * math.log(max(1, i + 1)) * 500.0 - stat_score * (439.0 / 4096.0)) / 1024.0
+                    base_red = (math.log(max(1, depth)) * math.log(max(1, rank)) * 500.0) / 1024.0
+                    legacy_reduction = (math.log(max(1, depth)) * math.log(max(1, rank)) * 500.0 - stat_score * (439.0 / 4096.0)) / 1024.0
                     r_base[i] = base_red
                     r_legacy[i] = legacy_reduction
                     z_legacy_mp[i] = float(np.clip(stat_score / 16384.0, -1.0, 1.0))
@@ -394,15 +405,17 @@ def compute_combined_losses(
     z_legacy_mp: torch.Tensor,
     r_base: torch.Tensor,
     r_legacy: torch.Tensor,
+    is_cap_mask: torch.Tensor,
     legal_mask: torch.Tensor,
     depth: torch.Tensor,
-    mp_anchor_coef: float = 0.20,
+    mp_shape_coef: float = 0.20,
     lmr_ord_coef: float = 0.45,
     rank_profile_coef: float = 0.20,
     push_up_coef: float = 0.050
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes Depth-Independent Residual LMR Loss with Detached MovePicker Scores:
+    - MovePicker: Monty KL divergence + Distributional Shape Loss (Mean & Variance matching on quiets and captures).
     - Pure Residual LMR: r_total = r_base(depth, rank) + delta_r_NN
     - Search Physics Invariants:
         * Move 1 (Top Pick): Always searched at FULL DEPTH (r = 0.00, effort = 1.00).
@@ -418,13 +431,30 @@ def compute_combined_losses(
     w_raw = torch.clamp(torch.sqrt(depth.clamp(min=1.0) / 8.0), 0.70, 1.40)
     w_depth = w_raw / w_raw.mean()
 
-    # 1. MovePicker KL + Anchor (Primary Driver)
+    # 1. MovePicker KL + Distributional Shape Loss (Primary Driver)
     masked_z = z_mp.masked_fill(~legal_mask, -1e4)
     mp_log_probs = F.log_softmax(masked_z / tau_mp, dim=-1)
     loss_mp_kl_per_pos = -(target_p_mp * mp_log_probs).sum(dim=-1)
     loss_mp_kl = (w_depth * loss_mp_kl_per_pos).mean()
-    loss_mp_anchor = F.smooth_l1_loss(z_mp[legal_mask], z_legacy_mp[legal_mask])
-    loss_mp_total = loss_mp_kl + mp_anchor_coef * loss_mp_anchor
+
+    # Distributional Shape Matching (Mean + Variance for Quiets and Captures)
+    quiet_mask = legal_mask & (~is_cap_mask)
+    cap_mask = legal_mask & is_cap_mask
+
+    loss_shape_quiet = torch.tensor(0.0, device=z_mp.device)
+    if quiet_mask.sum() > 1:
+        z_q_nn = z_mp[quiet_mask]
+        z_q_leg = z_legacy_mp[quiet_mask]
+        loss_shape_quiet = (z_q_nn.mean() - z_q_leg.mean()).pow(2) + (z_q_nn.std() - z_q_leg.std()).pow(2)
+
+    loss_shape_cap = torch.tensor(0.0, device=z_mp.device)
+    if cap_mask.sum() > 1:
+        z_c_nn = z_mp[cap_mask]
+        z_c_leg = z_legacy_mp[cap_mask]
+        loss_shape_cap = (z_c_nn.mean() - z_c_leg.mean()).pow(2) + (z_c_nn.std() - z_c_leg.std()).pow(2)
+
+    loss_mp_shape = loss_shape_quiet + loss_shape_cap
+    loss_mp_total = loss_mp_kl + mp_shape_coef * loss_mp_shape
 
     # 2. Residual Reductions: r_total = r_base + delta_r_nn
     r_total_nn = r_base + delta_r_nn
@@ -434,12 +464,12 @@ def compute_combined_losses(
     r_real_leg = torch.minimum(torch.maximum(r_legacy, min_red), max_red)
 
     # 3. LMR Force 1: Move-Order Dependent Search Allocation on Top Monty Move (Detached Scores)
-    scores = z_mp.detach() * 1200.0
+    scores = z_mp.detach() * 32768.0
     masked_s = scores.masked_fill(~legal_mask, -1e9)
     s_star = masked_s.gather(1, i_star.unsqueeze(1))
 
     score_diff = masked_s - s_star
-    soft_rank = torch.sigmoid(score_diff / 50.0).masked_fill(~legal_mask, 0.0)
+    soft_rank = torch.sigmoid(score_diff / 1000.0).masked_fill(~legal_mask, 0.0)
     i_star_mask = F.one_hot(i_star, num_classes=M).bool()
     soft_rank = soft_rank.masked_fill(i_star_mask, 0.0)
     k_rank = soft_rank.sum(dim=-1)
@@ -470,7 +500,7 @@ def compute_combined_losses(
     valid_ranks = 0
 
     # Individual Ranks 2 to 4 (0-indexed k = 1 to 3)
-    for k in range(1, min(MAX_LEGAL_MOVES, 4)):
+    for k in range(1, min(M, 4)):
         mask_k = (legal_mask.sum(dim=-1) > k)
         if mask_k.sum() > 0:
             e_nn_k = torch.exp(-sorted_r_nn[mask_k, k] / tau_lmr).mean()
@@ -480,7 +510,7 @@ def compute_combined_losses(
 
     # Merged Tail Bucket: All moves past rank 4 (0-indexed k >= 4, i.e. Moves 5+)
     num_legal = legal_mask.sum(dim=-1, keepdim=True)
-    rank_indices = torch.arange(MAX_LEGAL_MOVES, device=z_mp.device).unsqueeze(0).expand(B, MAX_LEGAL_MOVES)
+    rank_indices = torch.arange(M, device=z_mp.device).unsqueeze(0).expand(B, M)
     tail_mask = (rank_indices >= 4) & (rank_indices < num_legal)
 
     if tail_mask.sum() > 0:
@@ -501,7 +531,7 @@ def compute_combined_losses(
     mp_top1_acc = (masked_z.argmax(dim=-1) == i_star).float().mean()
     mean_q_star = Q_star.mean()
 
-    return loss_total, loss_mp_kl, loss_mp_anchor, loss_lmr_order, loss_rank_profile, loss_push_up, mp_top1_acc, mean_q_star
+    return loss_total, loss_mp_kl, loss_mp_shape, loss_lmr_order, loss_rank_profile, loss_push_up, mp_top1_acc, mean_q_star
 
 
 def evaluate_handcrafted_master(
@@ -528,12 +558,12 @@ def evaluate_handcrafted_master(
             r_real_leg = torch.minimum(torch.maximum(r_legacy, min_red), max_red)
 
             # Master LMR Move-Order Allocation
-            scores = z_legacy_mp * 1200.0
+            scores = z_legacy_mp * 32768.0
             masked_s = scores.masked_fill(~legal_mask, -1e9)
             s_star = masked_s.gather(1, i_star.unsqueeze(1))
 
             score_diff = masked_s - s_star
-            soft_rank = torch.sigmoid(score_diff / 50.0).masked_fill(~legal_mask, 0.0)
+            soft_rank = torch.sigmoid(score_diff / 1000.0).masked_fill(~legal_mask, 0.0)
             i_star_mask = F.one_hot(i_star, num_classes=M).bool()
             soft_rank = soft_rank.masked_fill(i_star_mask, 0.0)
             k_rank = soft_rank.sum(dim=-1)
@@ -551,18 +581,18 @@ def evaluate_handcrafted_master(
 
             p_first = torch.exp(-k_rank)
             Q_star = p_first * Q_k0 + (1.0 - p_first) * Q_k
-            loss_lmr_order = -torch.log(Q_star + 1e-12).mean()
+            loss_lmr_order = -(torch.log(Q_star + 1e-12)).mean()
 
             mp_top1_acc = (masked_z.argmax(dim=-1) == i_star).float().mean()
-            effort_leg = (E.sum(dim=-1) - E_star).mean()
-            mean_r = (r_real_leg * legal_mask.float()).sum() / legal_mask.sum()
+            effort_leg_late = (E.sum(dim=-1) - E_star).mean()
+            mean_r = r_real_leg[legal_mask].mean()
 
             total_count += B
             mp_kl_sum += loss_mp_kl.item() * B
             lmr_ord_sum += loss_lmr_order.item() * B
             mp_top1_sum += mp_top1_acc.item() * B
             q_star_sum += Q_star.mean().item() * B
-            tot_effort_sum += effort_leg.item() * B
+            tot_effort_sum += effort_leg_late.item() * B
             mean_r_sum += mean_r.item() * B
 
     n = max(1, total_count)
@@ -577,12 +607,13 @@ def evaluate_handcrafted_master(
 
 
 def evaluate_validation_rollout(
-    model: nn.Module,
+    model: DualMiniNN,
     loader: DataLoader,
     mp_anchor_coef: float = 0.20,
     lmr_ord_coef: float = 0.45,
     rank_profile_coef: float = 0.20,
-    push_up_coef: float = 0.050
+    push_up_coef: float = 0.050,
+    tau_lmr: float = 0.8658
 ) -> Dict[str, float]:
     model.eval()
     tot_loss_sum, mp_kl_sum, mp_anc_sum, lmr_ord_sum = 0.0, 0.0, 0.0, 0.0
@@ -594,13 +625,13 @@ def evaluate_validation_rollout(
         for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, legal_mask, depth in loader:
             w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, cap_scores, delta_r_nn = model(u_node, x_quiet, x_cap, x_lmr)
 
-            z_quiet = quiet_scores / 1200.0
-            z_cap = cap_scores / 1200.0
+            z_quiet = quiet_scores / 32768.0
+            z_cap = cap_scores / 32768.0
             z_mp = torch.where(is_cap, z_cap, z_quiet)
 
-            loss, loss_mp_kl, loss_mp_anc, loss_lmr_ord, loss_rank_prof, loss_push, mp_top1_acc, mean_q_star = compute_combined_losses(
-                z_mp, delta_r_nn, tau_mp, tau_lmr, target_p_mp, z_legacy_mp, r_base, r_legacy, legal_mask, depth,
-                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
+            loss, loss_mp_kl, loss_mp_shape, loss_lmr_ord, loss_rank_prof, loss_push, mp_top1_acc, mean_q_star = compute_combined_losses(
+                z_mp, delta_r_nn, tau_mp, tau_lmr, target_p_mp, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
+                mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
             )
 
             B = u_node.size(0)
@@ -934,6 +965,122 @@ def collect_target_samples(
     return merged_tel_path, monty_db_path, curr_ptr
 
 
+def run_heldout_online_evaluation(
+    model: DualMiniNN,
+    test_fens: List[str],
+    nodes_per_fen: int = 50_000,
+    sample_interval: int = 2000,
+    workers: int = 4,
+    session_tag: str = "heldout_test"
+) -> Dict[str, float]:
+    print("\n" + "=" * 80, flush=True)
+    print("   HELDOUT ONLINE POLICY & ON-POLICY PARITY EVALUATION", flush=True)
+    print("=" * 80, flush=True)
+
+    temp_model_path = f"/tmp/online_test_{session_tag}.miniNN"
+    model.export_quantized_binary(temp_model_path)
+
+    tel_path = os.path.join(CACHE_DIR, f"heldout_tel_{session_tag}.jsonl")
+    db_path = os.path.join(CACHE_DIR, f"heldout_monty_{session_tag}.db")
+    if os.path.exists(tel_path):
+        os.remove(tel_path)
+
+    # 1. Rollout C++ Stockfish searches on heldout test FENs with latest model loaded
+    chunk_size = math.ceil(len(test_fens) / workers)
+    chunks = [test_fens[i : i + chunk_size] for i in range(0, len(test_fens), chunk_size)]
+    worker_tel_paths = [os.path.join(CACHE_DIR, f"heldout_tel_w{w_id}_{session_tag}.jsonl") for w_id in range(len(chunks))]
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, sample_interval, temp_model_path, worker_tel_paths[w_id])
+            for w_id, chunk in enumerate(chunks)
+        ]
+        for f in as_completed(futures):
+            f.result()
+
+    with open(tel_path, "w") as out_f:
+        for p in worker_tel_paths:
+            if os.path.exists(p):
+                with open(p, "r") as in_f:
+                    for line in in_f:
+                        if line.strip():
+                            out_f.write(line)
+                os.remove(p)
+
+    # 2. Query Monty on heldout FENs
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS policies (fen TEXT PRIMARY KEY, policy_json TEXT)")
+    conn.commit()
+    conn.close()
+
+    m_chunks = [test_fens[i : i + chunk_size] for i in range(0, len(test_fens), chunk_size)]
+    worker_db_paths = [os.path.join(CACHE_DIR, f"heldout_m_w{w_id}_{session_tag}.db") for w_id in range(len(m_chunks))]
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(query_monty_worker, w_id, m_chunk, worker_db_paths[w_id])
+            for w_id, m_chunk in enumerate(m_chunks)
+        ]
+        for f in as_completed(futures):
+            f.result()
+
+    merge_worker_dbs(db_path, worker_db_paths)
+
+    # 3. Compute On-Policy Physical Move 1 match vs Monty Oracle
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    monty_policies = {}
+    for r in cur.execute("SELECT fen, policy_json FROM policies"):
+        monty_policies[r[0]] = json.loads(r[1])
+    conn.close()
+
+    total_positions = 0
+    top1_matches = 0
+    top3_matches = 0
+
+    if os.path.exists(tel_path):
+        with open(tel_path, "r") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    s = json.loads(line.strip())
+                except Exception:
+                    continue
+                fen = s["fen"]
+                moves = s.get("moves", [])
+                if not moves or fen not in monty_policies:
+                    continue
+
+                top_cpp_move = moves[0]["move"]
+                m_poly = monty_policies[fen]
+                sorted_monty = sorted(m_poly.keys(), key=lambda m: m_poly[m], reverse=True)
+
+                if sorted_monty and top_cpp_move == sorted_monty[0]:
+                    top1_matches += 1
+                if sorted_monty and top_cpp_move in sorted_monty[:3]:
+                    top3_matches += 1
+                total_positions += 1
+
+    top1_pct = (top1_matches / max(1, total_positions)) * 100.0
+    top3_pct = (top3_matches / max(1, total_positions)) * 100.0
+
+    print(f"Heldout Positions Evaluated: {total_positions:,}", flush=True)
+    print(f"Physical C++ Move 1 == Monty Top-1 Match: {top1_pct:.2f}%", flush=True)
+    print(f"Physical C++ Move 1 in Monty Top-3 Match:  {top3_pct:.2f}%", flush=True)
+    print("=" * 80 + "\n", flush=True)
+
+    if os.path.exists(temp_model_path):
+        os.remove(temp_model_path)
+
+    return {
+        "heldout_top1_match": top1_pct,
+        "heldout_top3_match": top3_pct,
+        "heldout_total_pos": total_positions
+    }
+
+
 def train_single_run(
     run_name: str,
     lr: float,
@@ -945,6 +1092,7 @@ def train_single_run(
     val_loader: DataLoader,
     val_dataset: RolloutDataset,
     train_fens_pool: List[str],
+    test_fens_pool: List[str],
     t_lmr: float,
     t_mp: float,
     floor_lmr: float,
@@ -981,31 +1129,29 @@ def train_single_run(
         optimizer,
         total_steps=total_training_steps,
         warmup_steps=warmup_steps,
-        floor_ratio=0.30,
-        init_ratio=0.10
+        floor_ratio=0.30
     )
 
+    fen_ptr = 0
     total_gradient_steps = 0
-    accumulated_steps = 0
-    train_fen_ptr = 0
 
     for iteration in range(1, args.iterations + 1):
-        t_iter_start = time.time()
+        t0 = time.time()
 
-        rollout_tel, rollout_db, train_fen_ptr = collect_target_samples(
+        fresh_tel, fresh_db, fen_ptr = collect_target_samples(
             fens_pool=train_fens_pool,
-            fen_offset=train_fen_ptr,
+            fen_offset=fen_ptr,
             target_samples=args.rollout_samples,
             nodes_per_fen=args.nodes,
             sample_interval=args.sample_interval,
             model_path=output_path,
             workers=args.workers,
-            session_tag=f"{run_name}_iter{iteration}"
+            session_tag=f"rollout_{run_name}"
         )
 
         rollout_dataset = RolloutDataset(
-            telemetry_path=rollout_tel,
-            monty_db_path=rollout_db,
+            telemetry_path=fresh_tel,
+            monty_db_path=fresh_db,
             floor_lmr=floor_lmr,
             floor_mp=floor_mp,
             t_lmr=t_lmr,
@@ -1023,13 +1169,13 @@ def train_single_run(
 
                 w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, cap_scores, delta_r_nn = model(u_node, x_quiet, x_cap, x_lmr)
 
-                z_quiet = quiet_scores / 1200.0
-                z_cap = cap_scores / 1200.0
+                z_quiet = quiet_scores / 32768.0
+                z_cap = cap_scores / 32768.0
                 z_mp = torch.where(is_cap, z_cap, z_quiet)
 
-                loss, loss_mp_kl, loss_mp_anc, loss_lmr_ord, loss_rank_prof, loss_push, mp_top1_acc, mean_q_star = compute_combined_losses(
-                    z_mp, delta_r_nn, tau_mp, tau_lmr, target_p_mp, z_legacy_mp, r_base, r_legacy, legal_mask, depth,
-                    mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
+                loss, loss_mp_kl, loss_mp_shape, loss_lmr_ord, loss_rank_prof, loss_push, mp_top1_acc, mean_q_star = compute_combined_losses(
+                    z_mp, delta_r_nn, tau_mp, tau_lmr, target_p_mp, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
+                    mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, push_up_coef=push_up_coef
                 )
 
                 loss.backward()
@@ -1039,25 +1185,22 @@ def train_single_run(
 
                 total_gradient_steps += 1
                 iter_steps += 1
-                accumulated_steps += 1
-
                 iter_loss += loss.item()
                 iter_mp_kl += loss_mp_kl.item()
                 iter_lmr_ord += loss_lmr_ord.item()
 
-                if accumulated_steps >= args.sync_interval:
+                if total_gradient_steps % args.sync_interval == 0:
                     model.export_quantized_binary(output_path)
-                    accumulated_steps = 0
 
         try:
-            if os.path.exists(rollout_tel):
-                os.remove(rollout_tel)
-            if os.path.exists(rollout_db):
-                os.remove(rollout_db)
+            if os.path.exists(fresh_tel):
+                os.remove(fresh_tel)
+            if os.path.exists(fresh_db):
+                os.remove(fresh_db)
         except Exception:
             pass
 
-        elapsed_iter = time.time() - t_iter_start
+        elapsed_iter = time.time() - t0
         curr_lr = scheduler.get_last_lr()[0]
         n_steps = max(1, iter_steps)
 
@@ -1081,6 +1224,19 @@ def train_single_run(
 
     # Output detailed 2D Depth x Rank Evaluation Matrix
     evaluate_2d_depth_rank_matrix(model, val_loader, tau_lmr=t_lmr)
+
+    # Final Online Testing Step on Heldout FENs
+    if test_fens_pool:
+        heldout_stats = run_heldout_online_evaluation(
+            model=model,
+            test_fens=test_fens_pool[:min(len(test_fens_pool), 1000)],
+            nodes_per_fen=min(50_000, args.nodes),
+            sample_interval=args.sample_interval,
+            workers=args.workers,
+            session_tag=f"{run_name}_heldout"
+        )
+        final_stats.update(heldout_stats)
+
     return final_stats
 
 
@@ -1096,6 +1252,7 @@ def main():
     parser.add_argument("--stream-limit", type=int, default=500000, help="Stream limit for FEN subsampling (default: 500,000)")
     parser.add_argument("--train-fens-pool", type=int, default=100000, help="Training FEN pool (default: 100,000)")
     parser.add_argument("--val-fens-pool", type=int, default=1000, help="Validation FEN pool (default: 1,000)")
+    parser.add_argument("--test-fens-pool", type=int, default=1000, help="Held-out Test FEN pool (default: 1,000)")
     parser.add_argument("--nodes", type=int, default=500_000, help="Search budget per FEN (default: 500,000)")
     parser.add_argument("--sample-interval", type=int, default=10_000, help="Subsample interval (default: 10,000)")
     parser.add_argument("--workers", type=int, default=6, help="Parallel worker threads (default: 6)")
@@ -1117,6 +1274,7 @@ def main():
     print(f"Validation Frequency:        Every {args.val_freq} iterations", flush=True)
     print(f"Validation Rollout Size:     {args.val_samples:,} samples (2^15)", flush=True)
     print(f"Validation FEN Pool:         {args.val_fens_pool:,} FENs (drawn from 500k stream)", flush=True)
+    print(f"Heldout Test FEN Pool:       {args.test_fens_pool:,} FENs (unseen test set)", flush=True)
     print(f"Rollout Buffer Size / Iter:  {args.rollout_samples} transitions", flush=True)
     print(f"Mini-Batch Size:             {args.minibatch_size}", flush=True)
     print(f"PPO Multi-Epochs / Iter:     {args.ppo_epochs} epochs ({args.ppo_epochs * math.ceil(args.rollout_samples / args.minibatch_size)} gradient steps/iter)", flush=True)
@@ -1125,10 +1283,11 @@ def main():
     print(f"Nodes per FEN Search:        {args.nodes:,}", flush=True)
     print("=" * 80, flush=True)
 
-    val_fens_pool, train_fens_pool = load_and_subsample_fens(
+    val_fens_pool, test_fens_pool, train_fens_pool = load_and_subsample_fens(
         epd_path=EPD_FILE,
         stream_limit=args.stream_limit,
         val_count=args.val_fens_pool,
+        test_count=args.test_fens_pool,
         train_count=args.train_fens_pool,
         seed=42
     )
@@ -1196,6 +1355,7 @@ def main():
                 val_loader=val_loader,
                 val_dataset=val_dataset,
                 train_fens_pool=train_fens_pool,
+                test_fens_pool=test_fens_pool,
                 t_lmr=t_lmr,
                 t_mp=t_mp,
                 floor_lmr=floor_lmr,
@@ -1228,6 +1388,7 @@ def main():
             val_loader=val_loader,
             val_dataset=val_dataset,
             train_fens_pool=train_fens_pool,
+            test_fens_pool=test_fens_pool,
             t_lmr=t_lmr,
             t_mp=t_mp,
             floor_lmr=floor_lmr,

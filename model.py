@@ -108,7 +108,7 @@ class QuietMoveNetwork(nn.Module):
         # Dynamic inner product with w_quiet
         w_exp = w_quiet.unsqueeze(1)
         z_quiet = torch.clamp((h * w_exp).sum(dim=-1), -1.0, 1.0)
-        quiet_scores = z_quiet * 1200.0
+        quiet_scores = z_quiet * 32768.0
         return z_quiet, quiet_scores
 
 
@@ -131,9 +131,9 @@ class CaptureMoveNetwork(nn.Module):
 
         w1 = quantize_ste(self.fc1.weight, self.scale)
         b1 = quantize_bias_ste(self.fc1.bias, self.scale * self.scale)
-        score_out = F.linear(h0, w1, b1).squeeze(-1) * 1200.0
-        cap_scores = torch.clamp(score_out, -1200.0, 1200.0)
-        z_cap = cap_scores / 1200.0
+        score_out = F.linear(h0, w1, b1).squeeze(-1)
+        z_cap = torch.clamp(score_out, -1.0, 1.0)
+        cap_scores = z_cap * 32768.0
         return z_cap, cap_scores
 
 
