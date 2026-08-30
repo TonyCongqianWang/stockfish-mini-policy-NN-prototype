@@ -76,7 +76,9 @@ fi
 # 5. Build Monty Native Release Binary
 echo "[5/5] Building Monty (make)..."
 cd "$MONTY_DIR"
-make
+NUM_CORES=$(nproc 2>/dev/null || echo 4)
+export CARGO_BUILD_JOBS="$NUM_CORES"
+make -j"$NUM_CORES"
 
 # 6. Sanity check
 MONTY_EXE="$MONTY_DIR/monty"

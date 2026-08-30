@@ -67,7 +67,9 @@ def main():
 
     # 4. Build Monty
     print("[5/5] Building Monty native release binary (make)...")
-    run_command(["make"], cwd=monty_dir, env=env)
+    num_cores = os.cpu_count() or 4
+    env["CARGO_BUILD_JOBS"] = str(num_cores)
+    run_command(["make", f"-j{num_cores}"], cwd=monty_dir, env=env)
 
     if not os.path.isfile(monty_exe):
         print(f"Error: Build completed but binary not found at {monty_exe}", file=sys.stderr)
