@@ -81,13 +81,13 @@ class NodeNetwork(nn.Module):
         # 16..23: 8 position latents for captures & LMR (scale 64, range [-127/64, 127/64])
         z_latents = quantize_ste(torch.clamp(out[:, 16:24], -127.0 / 64.0, 127.0 / 64.0), 64.0)
 
-        # 24: log_tau_mp
+        # 24: log_tau_mp (Base calibration ~0.1154)
         log_tau_mp = out[:, 24:25]
-        tau_mp = 0.6830 * torch.exp(torch.clamp(log_tau_mp, -1.5, 1.5))
+        tau_mp = 0.1154 * torch.exp(torch.clamp(log_tau_mp, -1.5, 1.5))
 
-        # 25: log_tau_lmr
+        # 25: log_tau_lmr (Base calibration ~0.8658)
         log_tau_lmr = out[:, 25:26]
-        tau_lmr = 0.1232 * torch.exp(torch.clamp(log_tau_lmr, -1.5, 1.5))
+        tau_lmr = 0.8658 * torch.exp(torch.clamp(log_tau_lmr, -1.5, 1.5))
 
         return w_quiet, z_latents, tau_mp, tau_lmr
 

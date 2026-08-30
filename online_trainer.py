@@ -1010,25 +1010,40 @@ def run_heldout_online_evaluation(
                             out_f.write(line)
                 os.remove(p)
 
-    # 2. Query Monty on heldout FENs
+    # 2. Extract unique FENs from tel_path and query Monty on them
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("CREATE TABLE IF NOT EXISTS policies (fen TEXT PRIMARY KEY, policy_json TEXT)")
     conn.commit()
     conn.close()
 
-    m_chunks = [test_fens[i : i + chunk_size] for i in range(0, len(test_fens), chunk_size)]
-    worker_db_paths = [os.path.join(CACHE_DIR, f"heldout_m_w{w_id}_{session_tag}.db") for w_id in range(len(m_chunks))]
+    fens_in_tel = set()
+    if os.path.exists(tel_path):
+        with open(tel_path, "r") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        f_str = json.loads(line.strip()).get("fen")
+                        if f_str:
+                            fens_in_tel.add(f_str)
+                    except Exception:
+                        pass
 
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(query_monty_worker, w_id, m_chunk, worker_db_paths[w_id])
-            for w_id, m_chunk in enumerate(m_chunks)
-        ]
-        for f in as_completed(futures):
-            f.result()
+    fens_to_query = list(fens_in_tel)
+    if fens_to_query:
+        m_chunk_size = math.ceil(len(fens_to_query) / workers)
+        m_chunks = [fens_to_query[i : i + m_chunk_size] for i in range(0, len(fens_to_query), m_chunk_size)]
+        worker_db_paths = [os.path.join(CACHE_DIR, f"heldout_m_w{w_id}_{session_tag}.db") for w_id in range(len(m_chunks))]
 
-    merge_worker_dbs(db_path, worker_db_paths)
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(query_monty_worker, w_id, m_chunk, worker_db_paths[w_id])
+                for w_id, m_chunk in enumerate(m_chunks)
+            ]
+            for f in as_completed(futures):
+                f.result()
+
+        merge_worker_dbs(db_path, worker_db_paths)
 
     # 3. Compute On-Policy Physical Move 1 match vs Monty Oracle
     conn = sqlite3.connect(db_path)
