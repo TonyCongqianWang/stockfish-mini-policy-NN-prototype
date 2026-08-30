@@ -507,7 +507,7 @@ def compute_combined_losses(
     loss_lmr_order = (w_depth * -(target_p_lmr * torch.log(Q_dist + 1e-12)).sum(dim=-1)).mean()
 
     # 5. Direct Physical Rank Profile MSE (Anchored to Master's baseline reduction profile)
-    loss_rank_profile = (w_depth * (delta_r_nn ** 2) * legal_mask.float()).sum() / legal_mask.sum()
+    loss_rank_profile = (w_depth.unsqueeze(1) * (delta_r_nn ** 2) * legal_mask.float()).sum() / legal_mask.sum().clamp(min=1.0)
 
     loss_lmr_total = lmr_ord_coef * loss_lmr_order + rank_profile_coef * loss_rank_profile
     loss_total = loss_mp_total + loss_lmr_total
