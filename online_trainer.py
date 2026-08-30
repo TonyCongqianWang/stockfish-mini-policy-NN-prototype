@@ -1299,31 +1299,30 @@ def train_single_run(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Closed-Loop On-Policy Mini-NN Dual Policy & LMR Trainer (Version 3)")
-    parser.add_argument("--iterations", type=int, default=8, help="Number of on-policy rollout iterations (default: 8)")
-    parser.add_argument("--rollout-samples", type=int, default=16384, help="Transitions per online rollout buffer (default: 16384)")
-    parser.add_argument("--val-samples", type=int, default=32768, help="Validation set fixed rollout samples (default: 32768)")
-    parser.add_argument("--stream-limit", type=int, default=500000, help="Initial stream limit of unique FENs (default: 500,000)")
-    parser.add_argument("--val-fens-pool", type=int, default=5000, help="Number of FENs dedicated to validation set (default: 5,000)")
-    parser.add_argument("--test-fens-pool", type=int, default=1000, help="Number of FENs dedicated to unseen test set (default: 1,000)")
-    parser.add_argument("--train-fens-pool", type=int, default=100000, help="Number of FENs dedicated to training rollouts (default: 100,000)")
-    parser.add_argument("--val-freq", type=int, default=1, help="Validation evaluation frequency in iterations (default: 1)")
-    parser.add_argument("--lr", type=float, default=4e-3, help="Learning rate with warmup-cosine schedule (default: 4e-3)")
-    parser.add_argument("--minibatch-size", type=int, default=256, help="Mini-batch size for SGD (default: 256)")
-    parser.add_argument("--ppo-epochs", type=int, default=4, help="PPO-style multi-epoch updates per iteration (default: 4)")
-    parser.add_argument("--mp-anchor-coef", type=float, default=0.20, help="MovePicker shape anchor regularization weight (default: 0.20)")
+    parser = argparse.ArgumentParser(description="On-Policy Dual Mini-NN Closed-Loop Trainer & Grid Runner.")
+    parser.add_argument("--iterations", type=int, default=128, help="Total outer iterations per run (default: 128)")
+    parser.add_argument("--rollout-samples", type=int, default=512, help="Fresh on-policy rollout buffer size per iteration (default: 512)")
+    parser.add_argument("--minibatch-size", type=int, default=64, help="Minibatch size for SGD updates (default: 64)")
+    parser.add_argument("--ppo-epochs", type=int, default=4, help="PPO multi-epoch passes over fresh rollout buffer (default: 4)")
+    parser.add_argument("--sync-interval", type=int, default=4, help="Gradient steps between model syncs (default: 4)")
+    parser.add_argument("--val-freq", type=int, default=8, help="Validation frequency (default: 8)")
+    parser.add_argument("--val-samples", type=int, default=32768, help="Fixed validation rollout samples (default: 32768 = 2^15)")
+    parser.add_argument("--stream-limit", type=int, default=500000, help="Stream limit for FEN subsampling (default: 500,000)")
+    parser.add_argument("--train-fens-pool", type=int, default=100000, help="Training FEN pool (default: 100,000)")
+    parser.add_argument("--val-fens-pool", type=int, default=1000, help="Validation FEN pool (default: 1,000)")
+    parser.add_argument("--test-fens-pool", type=int, default=1000, help="Held-out Test FEN pool (default: 1,000)")
+    parser.add_argument("--nodes", type=int, default=500_000, help="Search budget per FEN (default: 500,000)")
+    parser.add_argument("--sample-interval", type=int, default=10_000, help="Subsample interval (default: 10,000)")
+    parser.add_argument("--workers", type=int, default=6, help="Parallel worker threads (default: 6)")
+    parser.add_argument("--grid", action="store_true", help="Run the 3-experiment hyperparameter grid")
+    parser.add_argument("--lr", type=float, default=4e-3, help="Peak learning rate (default: 4e-3)")
+    parser.add_argument("--mp-anchor-coef", type=float, default=0.20, help="MovePicker anchor weight (default: 0.20)")
     parser.add_argument("--lmr-ord-coef", type=float, default=0.40, help="LMR policy cross-entropy weight (default: 0.40)")
-    parser.add_argument("--rank-profile-coef", type=float, default=0.40, help="LMR baseline rank profile anchor weight (default: 0.40)")
-    parser.add_argument("--nodes", type=int, default=15000, help="Stockfish nodes per FEN search (default: 15,000)")
-    parser.add_argument("--sample-interval", type=int, default=3000, help="C++ telemetry node sampling interval (default: 3,000)")
-    parser.add_argument("--sync-interval", type=int, default=16, help="Frequency of updating C++ weights in gradient steps (default: 16)")
-    parser.add_argument("--workers", type=int, default=12, help="Number of parallel C++ Stockfish workers (default: 12)")
-    parser.add_argument("--output", type=str, default="floored_dual_policy_run1.miniNN", help="Path to save trained quantized model")
-    parser.add_argument("--grid", action="store_true", help="Run comparative benchmark experiments")
-    args = parser.parse_args()
+    parser.add_argument("--rank-profile-coef", type=float, default=0.40, help="Rank profile MSE loss weight (default: 0.40)")
+    parser.add_argument("--output", type=str, default="floored_dual_64it.miniNN", help="Output model binary path")
 
-    t_lmr, floor_lmr = 0.8658, 0.010
-    t_mp, floor_mp = 0.1154, 0.010
+    args = parser.parse_args()
+    t_lmr, t_mp, floor_lmr, floor_mp = load_calibration_parameters()
 
     print("=" * 80, flush=True)
     print("   ON-POLICY CLOSED-LOOP DUAL MINI-NN TRAINER (FULL POLICY SEARCH ALLOCATION)", flush=True)
@@ -1379,12 +1378,12 @@ def main():
     if args.grid:
         grid_configs = [
             {
-                "name": "Run1_PolicyLMR_LR4e3",
+                "name": "Run1_Residual_LMR40",
                 "lr": 4e-3,
                 "mp_anchor": 0.20,
                 "lmr_ord": 0.40,
                 "rank_profile": 0.40,
-                "output": "floored_dual_policy_lr4e3.miniNN"
+                "output": "floored_dual_64it.miniNN"
             },
         ]
 
