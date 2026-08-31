@@ -16,3 +16,6 @@ data/
 *.db-wal
 *.db-shm
 *.log
+
+
+*.miniNN
