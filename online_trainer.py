@@ -937,17 +937,11 @@ def collect_or_load_offpolicy_buffer(
     - Master Stockfish searches without miniNN (pure handcrafted MovePicker & LMR).
     - Checks cache in CACHE_DIR (sf_tel_{session_tag}.jsonl, monty_{session_tag}.db).
     - If valid cached file with >= target_samples exists, reuses it immediately.
-    - Otherwise, searches across parallel workers and queries Monty to populate the replay buffer.
+    - Otherwise, searches dynamically only as many FENs as needed to gather target_samples, and queries Monty.
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
     merged_tel_path = os.path.join(CACHE_DIR, f"sf_tel_{session_tag}.jsonl")
     monty_db_path = os.path.join(CACHE_DIR, f"monty_{session_tag}.db")
-
-    conn = sqlite3.connect(monty_db_path)
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("CREATE TABLE IF NOT EXISTS policies (fen TEXT PRIMARY KEY, policy_json TEXT)")
-    conn.commit()
-    conn.close()
 
     if os.path.exists(merged_tel_path):
         valid_schema = False
@@ -969,76 +963,18 @@ def collect_or_load_offpolicy_buffer(
         else:
             os.remove(merged_tel_path)
 
-    print(f"      Generating Master off-policy replay buffer ({target_samples:,} samples from {len(train_fens_pool):,} training FENs)...", flush=True)
-    samples_per_fen = max(1, math.ceil(target_samples / len(train_fens_pool)))
-    eff_sample_interval = max(500, min(sample_interval, nodes_per_fen // samples_per_fen))
-
-    chunk_size = math.ceil(len(train_fens_pool) / workers)
-    chunks = [train_fens_pool[i : i + chunk_size] for i in range(0, len(train_fens_pool), chunk_size)]
-    worker_tel_paths = [os.path.join(CACHE_DIR, f"offpolicy_tel_w{w_id}_{session_tag}.jsonl") for w_id in range(len(chunks))]
-
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, eff_sample_interval, "", worker_tel_paths[w_id])
-            for w_id, chunk in enumerate(chunks)
-        ]
-        for f in as_completed(futures):
-            f.result()
-
-    all_lines = []
-    for p in worker_tel_paths:
-        if os.path.exists(p):
-            with open(p, "r") as in_f:
-                for line in in_f:
-                    if line.strip():
-                        all_lines.append(line)
-            os.remove(p)
-
-    rng = random.Random(42)
-    rng.shuffle(all_lines)
-
-    selected_lines = all_lines[:target_samples] if len(all_lines) >= target_samples else all_lines
-    if os.path.exists(merged_tel_path):
-        os.remove(merged_tel_path)
-
-    with open(merged_tel_path, "w") as out_f:
-        for line in selected_lines:
-            out_f.write(line)
-
-    conn = sqlite3.connect(monty_db_path)
-    cursor = conn.cursor()
-    cursor.execute("SELECT fen FROM policies")
-    cached = set(row[0] for row in cursor.fetchall())
-    conn.close()
-
-    uncached_fens = set()
-    with open(merged_tel_path, "r") as f:
-        for line in f:
-            if line.strip():
-                try:
-                    fen = json.loads(line.strip()).get("fen")
-                    if fen and fen not in cached:
-                        uncached_fens.add(fen)
-                except Exception:
-                    pass
-
-    fens_to_query = list(uncached_fens)
-    if fens_to_query:
-        m_chunk_size = math.ceil(len(fens_to_query) / workers)
-        m_chunks = [fens_to_query[i : i + m_chunk_size] for i in range(0, len(fens_to_query), m_chunk_size)]
-        worker_db_paths = [os.path.join(CACHE_DIR, f"offpolicy_m_w{w_id}_{session_tag}.db") for w_id in range(len(m_chunks))]
-
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = [
-                executor.submit(query_monty_worker, w_id, m_chunk, worker_db_paths[w_id])
-                for w_id, m_chunk in enumerate(m_chunks)
-            ]
-            for f in as_completed(futures):
-                f.result()
-
-        merge_worker_dbs(monty_db_path, worker_db_paths)
-
-    return merged_tel_path, monty_db_path
+    print(f"      Generating Master off-policy replay buffer ({target_samples:,} samples)...", flush=True)
+    tel_path, db_path, _ = collect_target_samples(
+        fens_pool=train_fens_pool,
+        fen_offset=0,
+        target_samples=target_samples,
+        nodes_per_fen=nodes_per_fen,
+        sample_interval=sample_interval,
+        model_path="",
+        workers=workers,
+        session_tag=session_tag
+    )
+    return tel_path, db_path
 
 
 def collect_target_samples(
