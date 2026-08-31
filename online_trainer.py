@@ -924,6 +924,123 @@ def collect_validation_rollout_even(
     return merged_tel_path, monty_db_path
 
 
+def collect_or_load_offpolicy_buffer(
+    train_fens_pool: List[str],
+    target_samples: int,
+    nodes_per_fen: int,
+    sample_interval: int,
+    workers: int,
+    session_tag: str = "master_offpolicy_shared_v3"
+) -> Tuple[str, str]:
+    """
+    Collects or reuses a large Master off-policy replay buffer:
+    - Master Stockfish searches without miniNN (pure handcrafted MovePicker & LMR).
+    - Checks cache in CACHE_DIR (sf_tel_{session_tag}.jsonl, monty_{session_tag}.db).
+    - If valid cached file with >= target_samples exists, reuses it immediately.
+    - Otherwise, searches across parallel workers and queries Monty to populate the replay buffer.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    merged_tel_path = os.path.join(CACHE_DIR, f"sf_tel_{session_tag}.jsonl")
+    monty_db_path = os.path.join(CACHE_DIR, f"monty_{session_tag}.db")
+
+    conn = sqlite3.connect(monty_db_path)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS policies (fen TEXT PRIMARY KEY, policy_json TEXT)")
+    conn.commit()
+    conn.close()
+
+    if os.path.exists(merged_tel_path):
+        valid_schema = False
+        try:
+            with open(merged_tel_path, "r") as f:
+                first_line = f.readline()
+                if first_line.strip():
+                    sample = json.loads(first_line.strip())
+                    if sample.get("moves") and "picker_rank" in sample["moves"][0]:
+                        valid_schema = True
+        except Exception:
+            valid_schema = False
+
+        if valid_schema:
+            count = sum(1 for _ in open(merged_tel_path))
+            if count >= target_samples:
+                print(f"      Reusing cached Master off-policy replay buffer ({count:,} samples) from {merged_tel_path}", flush=True)
+                return merged_tel_path, monty_db_path
+        else:
+            os.remove(merged_tel_path)
+
+    print(f"      Generating Master off-policy replay buffer ({target_samples:,} samples from {len(train_fens_pool):,} training FENs)...", flush=True)
+    samples_per_fen = max(1, math.ceil(target_samples / len(train_fens_pool)))
+    eff_sample_interval = max(500, min(sample_interval, nodes_per_fen // samples_per_fen))
+
+    chunk_size = math.ceil(len(train_fens_pool) / workers)
+    chunks = [train_fens_pool[i : i + chunk_size] for i in range(0, len(train_fens_pool), chunk_size)]
+    worker_tel_paths = [os.path.join(CACHE_DIR, f"offpolicy_tel_w{w_id}_{session_tag}.jsonl") for w_id in range(len(chunks))]
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, eff_sample_interval, "", worker_tel_paths[w_id])
+            for w_id, chunk in enumerate(chunks)
+        ]
+        for f in as_completed(futures):
+            f.result()
+
+    all_lines = []
+    for p in worker_tel_paths:
+        if os.path.exists(p):
+            with open(p, "r") as in_f:
+                for line in in_f:
+                    if line.strip():
+                        all_lines.append(line)
+            os.remove(p)
+
+    rng = random.Random(42)
+    rng.shuffle(all_lines)
+
+    selected_lines = all_lines[:target_samples] if len(all_lines) >= target_samples else all_lines
+    if os.path.exists(merged_tel_path):
+        os.remove(merged_tel_path)
+
+    with open(merged_tel_path, "w") as out_f:
+        for line in selected_lines:
+            out_f.write(line)
+
+    conn = sqlite3.connect(monty_db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT fen FROM policies")
+    cached = set(row[0] for row in cursor.fetchall())
+    conn.close()
+
+    uncached_fens = set()
+    with open(merged_tel_path, "r") as f:
+        for line in f:
+            if line.strip():
+                try:
+                    fen = json.loads(line.strip()).get("fen")
+                    if fen and fen not in cached:
+                        uncached_fens.add(fen)
+                except Exception:
+                    pass
+
+    fens_to_query = list(uncached_fens)
+    if fens_to_query:
+        m_chunk_size = math.ceil(len(fens_to_query) / workers)
+        m_chunks = [fens_to_query[i : i + m_chunk_size] for i in range(0, len(fens_to_query), m_chunk_size)]
+        worker_db_paths = [os.path.join(CACHE_DIR, f"offpolicy_m_w{w_id}_{session_tag}.db") for w_id in range(len(m_chunks))]
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(query_monty_worker, w_id, m_chunk, worker_db_paths[w_id])
+                for w_id, m_chunk in enumerate(m_chunks)
+            ]
+            for f in as_completed(futures):
+                f.result()
+
+        merge_worker_dbs(monty_db_path, worker_db_paths)
+
+    return merged_tel_path, monty_db_path
+
+
 def collect_target_samples(
     fens_pool: List[str],
     fen_offset: int,
@@ -1149,12 +1266,14 @@ def train_single_run(
     t_mp: float,
     floor_lmr: float,
     floor_mp: float,
-    output_path: str
+    output_path: str,
+    offpolicy_dataset: Optional[RolloutDataset] = None
 ) -> Dict[str, float]:
     print("\n" + "=" * 80, flush=True)
     print(f"   STARTING RUN: {run_name}", flush=True)
     print("=" * 80, flush=True)
     print(f"Iterations:                 {args.iterations:,}", flush=True)
+    print(f"Off-Policy Warmup:          {args.offpolicy_iterations} iters (Master replay buffer)", flush=True)
     print(f"Peak Learning Rate:         {lr:.4e}", flush=True)
     print(f"LR Schedule:                Warmup (min 2 iters) -> Cosine Decay (Floor: {0.30 * lr:.4e})", flush=True)
     print(f"Rollout Buffer Size:        {args.rollout_samples}", flush=True)
@@ -1165,6 +1284,25 @@ def train_single_run(
     print(f"Rank-Profile MSE Coef:      {rank_profile_coef:.2f}", flush=True)
     print(f"Output Binary:              {output_path}", flush=True)
     print("=" * 80, flush=True)
+
+    if args.offpolicy_iterations > 0 and offpolicy_dataset is None:
+        total_offpolicy_needed = max(8192, args.offpolicy_iterations * args.rollout_samples)
+        offpolicy_tel, offpolicy_db = collect_or_load_offpolicy_buffer(
+            train_fens_pool=train_fens_pool,
+            target_samples=total_offpolicy_needed,
+            nodes_per_fen=args.nodes,
+            sample_interval=args.sample_interval,
+            workers=args.workers,
+            session_tag="master_offpolicy_shared_v3"
+        )
+        offpolicy_dataset = RolloutDataset(
+            telemetry_path=offpolicy_tel,
+            monty_db_path=offpolicy_db,
+            floor_lmr=floor_lmr,
+            floor_mp=floor_mp,
+            t_lmr=t_lmr,
+            t_mp=t_mp
+        )
 
     model = DualMiniNN()
     model.export_quantized_binary(output_path)
@@ -1188,27 +1326,43 @@ def train_single_run(
 
     for iteration in range(1, args.iterations + 1):
         t0 = time.time()
+        is_offpolicy = (iteration <= args.offpolicy_iterations) and (offpolicy_dataset is not None)
 
-        fresh_tel, fresh_db, curr_fen_offset = collect_target_samples(
-            fens_pool=train_fens_pool,
-            fen_offset=curr_fen_offset,
-            target_samples=args.rollout_samples,
-            nodes_per_fen=args.nodes,
-            sample_interval=args.sample_interval,
-            model_path=output_path,
-            workers=args.workers,
-            session_tag=f"{run_name}_iter{iteration}"
-        )
+        if is_offpolicy:
+            phase_tag = "Off-Policy"
+            buf_len = len(offpolicy_dataset)
+            start_idx = ((iteration - 1) * args.rollout_samples) % buf_len
+            indices = [(start_idx + i) % buf_len for i in range(args.rollout_samples)]
+            iter_subset = torch.utils.data.Subset(offpolicy_dataset, indices)
+            train_loader = DataLoader(iter_subset, batch_size=args.minibatch_size, shuffle=True)
+            fresh_tel, fresh_db = "", ""
+        else:
+            if iteration == args.offpolicy_iterations + 1 and args.offpolicy_iterations > 0:
+                print("\n" + "=" * 80, flush=True)
+                print("   >>> SWITCHING TO PHASE 2: ON-POLICY NEURAL SEARCH REFINEMENT <<<", flush=True)
+                print("=" * 80 + "\n", flush=True)
 
-        train_dataset = RolloutDataset(
-            telemetry_path=fresh_tel,
-            monty_db_path=fresh_db,
-            floor_lmr=floor_lmr,
-            floor_mp=floor_mp,
-            t_lmr=t_lmr,
-            t_mp=t_mp
-        )
-        train_loader = DataLoader(train_dataset, batch_size=args.minibatch_size, shuffle=True)
+            phase_tag = "On-Policy"
+            fresh_tel, fresh_db, curr_fen_offset = collect_target_samples(
+                fens_pool=train_fens_pool,
+                fen_offset=curr_fen_offset,
+                target_samples=args.rollout_samples,
+                nodes_per_fen=args.nodes,
+                sample_interval=args.sample_interval,
+                model_path=output_path,
+                workers=args.workers,
+                session_tag=f"{run_name}_iter{iteration}"
+            )
+
+            train_dataset = RolloutDataset(
+                telemetry_path=fresh_tel,
+                monty_db_path=fresh_db,
+                floor_lmr=floor_lmr,
+                floor_mp=floor_mp,
+                t_lmr=t_lmr,
+                t_mp=t_mp
+            )
+            train_loader = DataLoader(train_dataset, batch_size=args.minibatch_size, shuffle=True)
 
         iter_steps = 0
         iter_loss, iter_mp_kl_q, iter_mp_kl_c, iter_lmr_ord = 0.0, 0.0, 0.0, 0.0
@@ -1241,13 +1395,14 @@ def train_single_run(
                 if total_gradient_steps % args.sync_interval == 0:
                     model.export_quantized_binary(output_path)
 
-        try:
-            if os.path.exists(fresh_tel):
-                os.remove(fresh_tel)
-            if os.path.exists(fresh_db):
-                os.remove(fresh_db)
-        except Exception:
-            pass
+        if not is_offpolicy:
+            try:
+                if fresh_tel and os.path.exists(fresh_tel):
+                    os.remove(fresh_tel)
+                if fresh_db and os.path.exists(fresh_db):
+                    os.remove(fresh_db)
+            except Exception:
+                pass
 
         elapsed_iter = time.time() - t0
         curr_lr = scheduler.get_last_lr()[0]
@@ -1258,11 +1413,11 @@ def train_single_run(
                 model, val_loader,
                 mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
             )
-            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
+            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
                   f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Pol: {iter_lmr_ord/n_steps:.3f}) | "
                   f"Val MP: (Q:{val_stats['quiet_top1']:5.2f}%, C:{val_stats['cap_top1']:5.2f}%) | Val Alloc Q(i*): {val_stats['q_search_star']:5.2f}% | Effort: {val_stats['mean_effort']:.3f} | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
         else:
-            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations}] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
+            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
                   f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Pol: {iter_lmr_ord/n_steps:.3f})", flush=True)
 
     final_stats = evaluate_validation_rollout(
@@ -1292,6 +1447,7 @@ def train_single_run(
 def main():
     parser = argparse.ArgumentParser(description="On-Policy Dual Mini-NN Closed-Loop Trainer & Grid Runner.")
     parser.add_argument("--iterations", type=int, default=128, help="Total outer iterations per run (default: 128)")
+    parser.add_argument("--offpolicy-iterations", type=int, default=16, help="Number of initial off-policy warmup iterations using Master movepicker & LMR before switching to on-policy (default: 16)")
     parser.add_argument("--rollout-samples", type=int, default=512, help="Fresh on-policy rollout buffer size per iteration (default: 512)")
     parser.add_argument("--minibatch-size", type=int, default=64, help="Minibatch size for SGD updates (default: 64)")
     parser.add_argument("--ppo-epochs", type=int, default=4, help="PPO multi-epoch passes over fresh rollout buffer (default: 4)")
@@ -1319,6 +1475,7 @@ def main():
     print("   ON-POLICY CLOSED-LOOP DUAL MINI-NN TRAINER (FULL POLICY SEARCH ALLOCATION)", flush=True)
     print("=" * 80, flush=True)
     print(f"Total Iterations:            {args.iterations:,}", flush=True)
+    print(f"Off-Policy Warmup Iterations:{args.offpolicy_iterations:>8d} (Master handcrafted search replay buffer)", flush=True)
     print(f"Validation Frequency:        Every {args.val_freq} iterations", flush=True)
     print(f"Validation Rollout Size:     {args.val_samples:,} samples (2^15)", flush=True)
     print(f"Validation FEN Pool:         {args.val_fens_pool:,} FENs (drawn from 500k stream)", flush=True)
@@ -1362,6 +1519,31 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=args.minibatch_size, shuffle=False)
     print(f"      Validation set ready: {len(val_dataset):,} samples in {time.time() - t_v0:.1f}s.\n", flush=True)
 
+    offpolicy_dataset = None
+    if args.offpolicy_iterations > 0:
+        total_offpolicy_needed = max(8192, args.offpolicy_iterations * args.rollout_samples)
+        print(f"[2/3] Loading / Generating Master Off-Policy Replay Buffer ({total_offpolicy_needed:,} samples for {args.offpolicy_iterations} warmup iterations)...", flush=True)
+        t_op0 = time.time()
+        offpolicy_tel, offpolicy_db = collect_or_load_offpolicy_buffer(
+            train_fens_pool=train_fens_pool,
+            target_samples=total_offpolicy_needed,
+            nodes_per_fen=args.nodes,
+            sample_interval=args.sample_interval,
+            workers=args.workers,
+            session_tag="master_offpolicy_shared_v3"
+        )
+        offpolicy_dataset = RolloutDataset(
+            telemetry_path=offpolicy_tel,
+            monty_db_path=offpolicy_db,
+            floor_lmr=floor_lmr,
+            floor_mp=floor_mp,
+            t_lmr=t_lmr,
+            t_mp=t_mp
+        )
+        print(f"      Master off-policy replay buffer ready: {len(offpolicy_dataset):,} samples in {time.time() - t_op0:.1f}s.\n", flush=True)
+    else:
+        print(f"[2/3] Skipping Master Off-Policy Replay Buffer (pure on-policy mode).\n", flush=True)
+
     # Master Baseline Evaluation on Fixed 2^15 Validation Set
     master_stats = evaluate_handcrafted_master(val_loader, tau_mp=t_mp, tau_lmr=t_lmr)
     print_unified_benchmark_report("Handcrafted Stockfish Master Baseline", master_stats)
@@ -1395,7 +1577,8 @@ def main():
                 t_mp=t_mp,
                 floor_lmr=floor_lmr,
                 floor_mp=floor_mp,
-                output_path=cfg["output"]
+                output_path=cfg["output"],
+                offpolicy_dataset=offpolicy_dataset
             )
             results[cfg["name"]] = stats
 
@@ -1441,7 +1624,8 @@ def main():
             t_mp=t_mp,
             floor_lmr=floor_lmr,
             floor_mp=floor_mp,
-            output_path=args.output
+            output_path=args.output,
+            offpolicy_dataset=offpolicy_dataset
         )
 
         print("\n" + "=" * 100, flush=True)
