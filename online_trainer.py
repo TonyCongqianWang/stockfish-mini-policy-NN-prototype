@@ -127,7 +127,9 @@ def run_stockfish_search_worker(
     nodes_per_fen: int,
     sample_interval: int,
     model_path: str,
-    output_path: str
+    output_path: str,
+    use_mp: bool = True,
+    use_lmr: bool = True
 ) -> int:
     if os.path.exists(output_path):
         os.remove(output_path)
@@ -135,6 +137,8 @@ def run_stockfish_search_worker(
     env = os.environ.copy()
     env["SF_LMR_TELEMETRY"] = output_path
     env["SF_LMR_SAMPLE_INTERVAL"] = str(sample_interval)
+    env["SF_MININN_USE_MP"] = "1" if use_mp else "0"
+    env["SF_MININN_USE_LMR"] = "1" if use_lmr else "0"
     if model_path and os.path.exists(model_path):
         env["SF_MININN_PATH"] = model_path
 
@@ -148,7 +152,7 @@ def run_stockfish_search_worker(
         bufsize=1
     )
 
-    proc.stdin.write("uci\nsetoption name Threads value 1\nisready\n")
+    proc.stdin.write(f"uci\nsetoption name Threads value 1\nsetoption name Use_MiniNN_MP value {str(use_mp).lower()}\nsetoption name Use_MiniNN_LMR value {str(use_lmr).lower()}\nisready\n")
     proc.stdin.flush()
     while True:
         line = proc.stdout.readline()
@@ -428,7 +432,8 @@ def compute_combined_losses(
     depth: torch.Tensor,
     mp_shape_coef: float = 0.20,
     lmr_ord_coef: float = 0.40,
-    rank_profile_coef: float = 0.40
+    rank_profile_coef: float = 0.40,
+    train_mode: str = "both"
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes Direct Physical Search Allocation and Independent Quiet/Capture MovePicker Losses:
@@ -515,7 +520,14 @@ def compute_combined_losses(
     loss_rank_profile = (w_depth.unsqueeze(1) * (delta_r_nn ** 2) * legal_mask.float()).sum() / legal_mask.sum().clamp(min=1.0)
 
     loss_lmr_total = lmr_ord_coef * loss_lmr_order + rank_profile_coef * loss_rank_profile
-    loss_total = loss_mp_total + loss_lmr_total
+
+    if train_mode == "movepicker":
+        loss_total = loss_mp_total
+    elif train_mode == "lmr":
+        loss_total = loss_lmr_total
+    else:
+        loss_total = loss_mp_total + loss_lmr_total
+
     mean_q_star = Q_dist.gather(1, i_star.unsqueeze(1)).squeeze(1).mean()
 
     return loss_total, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_order, loss_rank_profile, acc_q, acc_c, mean_q_star
@@ -668,7 +680,8 @@ def evaluate_validation_rollout(
     mp_anchor_coef: float = 0.20,
     lmr_ord_coef: float = 0.40,
     rank_profile_coef: float = 0.40,
-    tau_lmr: float = 1.5
+    tau_lmr: float = 1.5,
+    train_mode: str = "both"
 ) -> Dict[str, float]:
     model.eval()
     tot_loss_sum, mp_anc_sum, rank_prof_loss_sum = 0.0, 0.0, 0.0
@@ -684,7 +697,7 @@ def evaluate_validation_rollout(
 
             loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, acc_q, acc_c, mean_q_star = compute_combined_losses(
                 z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
-                mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
+                mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, train_mode=train_mode
             )
 
             r_total_nn = r_base + delta_r_nn
@@ -985,7 +998,9 @@ def collect_target_samples(
     sample_interval: int,
     model_path: str,
     workers: int,
-    session_tag: str
+    session_tag: str,
+    use_mp: bool = True,
+    use_lmr: bool = True
 ) -> Tuple[str, str, int]:
     os.makedirs(CACHE_DIR, exist_ok=True)
     merged_tel_path = os.path.join(CACHE_DIR, f"sf_tel_{session_tag}.jsonl")
@@ -1011,7 +1026,7 @@ def collect_target_samples(
 
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = [
-                executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, sample_interval, model_path, worker_tel_paths[w_id])
+                executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, sample_interval, model_path, worker_tel_paths[w_id], use_mp, use_lmr)
                 for w_id, chunk in enumerate(chunks)
             ]
             for f in as_completed(futures):
@@ -1076,7 +1091,9 @@ def run_heldout_online_evaluation(
     target_samples: int = 32768,
     nodes_per_fen: int = 50_000,
     workers: int = 4,
-    session_tag: str = "heldout_test"
+    session_tag: str = "heldout_test",
+    use_mp: bool = True,
+    use_lmr: bool = True
 ) -> Dict[str, float]:
     tag_name = "NEURAL MININN" if model is not None else "HANDCRAFTED STOCKFISH MASTER"
     print("\n" + "=" * 80, flush=True)
@@ -1108,7 +1125,7 @@ def run_heldout_online_evaluation(
 
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = [
-                executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, sample_interval, temp_model_path, worker_tel_paths[w_id])
+                executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, sample_interval, temp_model_path, worker_tel_paths[w_id], use_mp, use_lmr)
                 for w_id, chunk in enumerate(chunks)
             ]
             for f in as_completed(futures):
@@ -1240,6 +1257,11 @@ def train_single_run(
             t_mp=t_mp
         )
 
+    train_mode = getattr(args, "train_mode", "both")
+    use_mp = (train_mode != "lmr")
+    use_lmr = (train_mode != "movepicker")
+    mode_str = "MovePicker Only" if train_mode == "movepicker" else ("LMR Only" if train_mode == "lmr" else "Dual MP+LMR")
+
     model = DualMiniNN()
     model.export_quantized_binary(output_path)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -1275,7 +1297,7 @@ def train_single_run(
         else:
             if iteration == args.offpolicy_iterations + 1 and args.offpolicy_iterations > 0:
                 print("\n" + "=" * 80, flush=True)
-                print("   >>> SWITCHING TO PHASE 2: ON-POLICY NEURAL SEARCH REFINEMENT <<<", flush=True)
+                print(f"   >>> SWITCHING TO PHASE 2: ON-POLICY NEURAL SEARCH REFINEMENT ({mode_str.upper()}) <<<", flush=True)
                 print("=" * 80 + "\n", flush=True)
 
             phase_tag = "On-Policy"
@@ -1287,7 +1309,9 @@ def train_single_run(
                 sample_interval=args.sample_interval,
                 model_path=output_path,
                 workers=args.workers,
-                session_tag=f"{run_name}_iter{iteration}"
+                session_tag=f"{run_name}_iter{iteration}",
+                use_mp=use_mp,
+                use_lmr=use_lmr
             )
 
             train_dataset = RolloutDataset(
@@ -1313,7 +1337,7 @@ def train_single_run(
 
                 loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, _, _, _ = compute_combined_losses(
                     z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
-                    mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
+                    mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, train_mode=train_mode
                 )
 
                 loss.backward()
@@ -1347,18 +1371,18 @@ def train_single_run(
         if iteration % args.val_freq == 0 or iteration == 1 or iteration == args.iterations:
             val_stats = evaluate_validation_rollout(
                 model, val_loader,
-                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
+                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, train_mode=train_mode
             )
-            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
+            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag} | {mode_str})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
                   f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Pol: {iter_lmr_ord/n_steps:.3f}) | "
                   f"Val MP: (Q:{val_stats['quiet_top1']:5.2f}%, C:{val_stats['cap_top1']:5.2f}%) | Val Alloc Q(i*): {val_stats['q_search_star']:5.2f}% | Effort: {val_stats['mean_effort']:.3f} | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
         else:
-            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
+            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag} | {mode_str})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
                   f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Pol: {iter_lmr_ord/n_steps:.3f})", flush=True)
 
     final_stats = evaluate_validation_rollout(
         model, val_loader,
-        mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef
+        mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, train_mode=train_mode
     )
     model.export_quantized_binary(output_path)
 
@@ -1373,7 +1397,9 @@ def train_single_run(
             target_samples=args.val_samples,
             nodes_per_fen=args.nodes,
             workers=args.workers,
-            session_tag=f"{run_name}_heldout_eval"
+            session_tag=f"{run_name}_heldout_eval",
+            use_mp=use_mp,
+            use_lmr=use_lmr
         )
         final_stats.update(heldout_stats)
 
@@ -1384,6 +1410,9 @@ def main():
     parser = argparse.ArgumentParser(description="On-Policy Dual Mini-NN Closed-Loop Trainer & Grid Runner.")
     parser.add_argument("--iterations", type=int, default=128, help="Total outer iterations per run (default: 128)")
     parser.add_argument("--offpolicy-iterations", type=int, default=16, help="Number of initial off-policy warmup iterations using Master movepicker & LMR before switching to on-policy (default: 16)")
+    parser.add_argument("--train-mode", type=str, choices=["both", "movepicker", "lmr"], default="both", help="Training mode: 'movepicker' (MP only, Master LMR), 'lmr' (LMR only, Master MP), 'both' (dual joint MP+LMR) (default: both)")
+    parser.add_argument("--movepicker-only", action="store_true", help="Shortcut for --train-mode movepicker")
+    parser.add_argument("--lmr-only", action="store_true", help="Shortcut for --train-mode lmr")
     parser.add_argument("--rollout-samples", type=int, default=512, help="Fresh on-policy rollout buffer size per iteration (default: 512)")
     parser.add_argument("--minibatch-size", type=int, default=64, help="Minibatch size for SGD updates (default: 64)")
     parser.add_argument("--ppo-epochs", type=int, default=4, help="PPO multi-epoch passes over fresh rollout buffer (default: 4)")
@@ -1405,11 +1434,19 @@ def main():
     parser.add_argument("--output", type=str, default="floored_dual_64it.miniNN", help="Output model binary path")
 
     args = parser.parse_args()
+    if args.movepicker_only:
+        args.train_mode = "movepicker"
+    elif args.lmr_only:
+        args.train_mode = "lmr"
+
     t_lmr, t_mp, floor_lmr, floor_mp = load_calibration_parameters()
+
+    mode_display = "MovePicker Only (Master LMR)" if args.train_mode == "movepicker" else ("LMR Only (Master MovePicker)" if args.train_mode == "lmr" else "Dual (MovePicker + LMR)")
 
     print("=" * 80, flush=True)
     print("   ON-POLICY CLOSED-LOOP DUAL MINI-NN TRAINER (FULL POLICY SEARCH ALLOCATION)", flush=True)
     print("=" * 80, flush=True)
+    print(f"Training Mode:               {mode_display}", flush=True)
     print(f"Total Iterations:            {args.iterations:,}", flush=True)
     print(f"Off-Policy Warmup Iterations:{args.offpolicy_iterations:>8d} (Master handcrafted search replay buffer)", flush=True)
     print(f"Validation Frequency:        Every {args.val_freq} iterations", flush=True)
