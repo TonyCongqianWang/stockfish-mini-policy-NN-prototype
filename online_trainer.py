@@ -424,6 +424,38 @@ class RolloutDataset(Dataset):
     def __getitem__(self, idx):
         return self.items[idx]
 
+    def compute_variance_matched_temperatures(self) -> Tuple[float, float]:
+        var_z_legacy_mp = []
+        var_log_p_mp = []
+        var_r_legacy = []
+        var_log_p_lmr = []
+
+        for item in self.items:
+            u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth = item
+            m_mask = legal_mask.numpy()
+            z_m = z_legacy_mp[m_mask].numpy()
+            p_mp_m = target_p_mp[m_mask].numpy()
+            p_lmr_m = target_p_lmr[m_mask].numpy()
+            r_m = r_legacy[m_mask].numpy()
+
+            if len(z_m) > 2:
+                log_p_mp_m = np.log(p_mp_m + 1e-12)
+                log_p_lmr_m = np.log(p_lmr_m + 1e-12)
+                var_z_legacy_mp.append(np.var(z_m))
+                var_log_p_mp.append(np.var(log_p_mp_m))
+                var_r_legacy.append(np.var(r_m))
+                var_log_p_lmr.append(np.var(log_p_lmr_m))
+
+        std_z = np.sqrt(np.mean(var_z_legacy_mp)) if var_z_legacy_mp else 0.4750
+        std_logp_mp = np.sqrt(np.mean(var_log_p_mp)) if var_log_p_mp else 1.9911
+        matched_tau_mp = float(std_z / max(1e-6, std_logp_mp))
+
+        std_r = np.sqrt(np.mean(var_r_legacy)) if var_r_legacy else 1.4779
+        std_logp_lmr = np.sqrt(np.mean(var_log_p_lmr)) if var_log_p_lmr else 0.8259
+        matched_tau_lmr = float(std_r / max(1e-6, std_logp_lmr))
+
+        return matched_tau_mp, matched_tau_lmr
+
 
 def compute_combined_losses(
     z_quiet: torch.Tensor,
@@ -875,34 +907,51 @@ def collect_validation_rollout_even(
         else:
             os.remove(merged_tel_path)
 
+    # To guarantee >= target_samples, sample frequently enough from the FEN pool
     samples_per_fen = max(1, math.ceil(target_samples / len(val_fens_pool)))
-    sample_interval = max(1000, nodes_per_fen // samples_per_fen)
+    # Use high-density sampling rate (at least 3.0x density) to guarantee reaching target_samples
+    sample_interval = max(1000, nodes_per_fen // max(1, int(samples_per_fen * 3.0)))
 
-    chunk_size = math.ceil(len(val_fens_pool) / workers)
-    chunks = [val_fens_pool[i : i + chunk_size] for i in range(0, len(val_fens_pool), chunk_size)]
-    worker_tel_paths = [os.path.join(CACHE_DIR, f"tel_w{w_id}_{session_tag}.jsonl") for w_id in range(len(chunks))]
-
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, sample_interval, "", worker_tel_paths[w_id])
-            for w_id, chunk in enumerate(chunks)
-        ]
-        for f in as_completed(futures):
-            f.result()
-
+    curr_idx = 0
     all_lines = []
-    for p in worker_tel_paths:
-        if os.path.exists(p):
-            with open(p, "r") as in_f:
-                for line in in_f:
-                    if line.strip():
-                        all_lines.append(line)
-            os.remove(p)
+
+    while len(all_lines) < target_samples:
+        batch_fens_count = len(val_fens_pool) if len(all_lines) == 0 else max(50, int(math.ceil((target_samples - len(all_lines)) / 20)))
+        fens_slice = [val_fens_pool[(curr_idx + i) % len(val_fens_pool)] for i in range(batch_fens_count)]
+        curr_idx += batch_fens_count
+
+        chunk_size = math.ceil(len(fens_slice) / workers)
+        chunks = [fens_slice[i : i + chunk_size] for i in range(0, len(fens_slice), chunk_size)]
+        worker_tel_paths = [os.path.join(CACHE_DIR, f"tel_w{w_id}_{session_tag}.jsonl") for w_id in range(len(chunks))]
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, sample_interval, "", worker_tel_paths[w_id])
+                for w_id, chunk in enumerate(chunks)
+            ]
+            for f in as_completed(futures):
+                f.result()
+
+        for p in worker_tel_paths:
+            if os.path.exists(p):
+                with open(p, "r") as in_f:
+                    for line in in_f:
+                        if line.strip():
+                            try:
+                                obj = json.loads(line.strip())
+                                if obj.get("moves") and len(obj["moves"]) >= 3:
+                                    all_lines.append(line)
+                            except Exception:
+                                pass
+                os.remove(p)
+
+        if len(all_lines) < target_samples:
+            sample_interval = max(1000, sample_interval // 2)
 
     rng = random.Random(42)
     rng.shuffle(all_lines)
 
-    selected_lines = all_lines[:target_samples] if len(all_lines) >= target_samples else all_lines
+    selected_lines = all_lines[:target_samples]
     if os.path.exists(merged_tel_path):
         os.remove(merged_tel_path)
 
@@ -1126,31 +1175,46 @@ def run_heldout_online_evaluation(
     # 1. Rollout C++ Stockfish searches on heldout test FENs (cached for Master)
     if not (model is None and os.path.exists(tel_path) and os.path.getsize(tel_path) > 0 and os.path.exists(db_path)):
         samples_per_fen = max(1, math.ceil(target_samples / len(test_fens)))
-        sample_interval = max(500, nodes_per_fen // samples_per_fen)
+        sample_interval = max(500, nodes_per_fen // max(1, int(samples_per_fen * 3.0)))
 
-        chunk_size = math.ceil(len(test_fens) / workers)
-        chunks = [test_fens[i : i + chunk_size] for i in range(0, len(test_fens), chunk_size)]
-        worker_tel_paths = [os.path.join(CACHE_DIR, f"heldout_tel_w{w_id}_{session_tag}.jsonl") for w_id in range(len(chunks))]
-
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = [
-                executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, sample_interval, temp_model_path, worker_tel_paths[w_id], use_mp, use_lmr)
-                for w_id, chunk in enumerate(chunks)
-            ]
-            for f in as_completed(futures):
-                f.result()
-
+        curr_ptr = 0
         all_lines = []
-        for p in worker_tel_paths:
-            if os.path.exists(p):
-                with open(p, "r") as in_f:
-                    for line in in_f:
-                        if line.strip():
-                            all_lines.append(line)
-                os.remove(p)
+
+        while len(all_lines) < target_samples:
+            batch_count = len(test_fens) if len(all_lines) == 0 else max(50, int(math.ceil((target_samples - len(all_lines)) / 20)))
+            fens_slice = [test_fens[(curr_ptr + i) % len(test_fens)] for i in range(batch_count)]
+            curr_ptr += batch_count
+
+            chunk_size = math.ceil(len(fens_slice) / workers)
+            chunks = [fens_slice[i : i + chunk_size] for i in range(0, len(fens_slice), chunk_size)]
+            worker_tel_paths = [os.path.join(CACHE_DIR, f"heldout_tel_w{w_id}_{session_tag}.jsonl") for w_id in range(len(chunks))]
+
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(run_stockfish_search_worker, w_id, chunk, nodes_per_fen, sample_interval, temp_model_path, worker_tel_paths[w_id], use_mp, use_lmr)
+                    for w_id, chunk in enumerate(chunks)
+                ]
+                for f in as_completed(futures):
+                    f.result()
+
+            for p in worker_tel_paths:
+                if os.path.exists(p):
+                    with open(p, "r") as in_f:
+                        for line in in_f:
+                            if line.strip():
+                                try:
+                                    obj = json.loads(line.strip())
+                                    if obj.get("moves") and len(obj["moves"]) >= 3:
+                                        all_lines.append(line)
+                                except Exception:
+                                    pass
+                    os.remove(p)
+
+            if len(all_lines) < target_samples:
+                sample_interval = max(500, sample_interval // 2)
 
         with open(tel_path, "w") as out_f:
-            for line in all_lines:
+            for line in all_lines[:target_samples]:
                 out_f.write(line)
 
         # 2. Extract unique FENs from tel_path and query Monty on them
@@ -1486,10 +1550,12 @@ def main():
     parser.add_argument("--mp-anchor-coef", type=float, default=0.20, help="MovePicker anchor weight (default: 0.20)")
     parser.add_argument("--lmr-ord-coef", type=float, default=0.40, help="LMR policy cross-entropy weight (default: 0.40)")
     parser.add_argument("--rank-profile-coef", type=float, default=0.40, help="Rank profile MSE loss weight (default: 0.40)")
+    parser.add_argument("--auto-align-temperatures", action="store_true", default=True, help="Automatically align student logit variance to teacher target log-probability variance on the validation dataset (default: True)")
+    parser.add_argument("--no-auto-align-temperatures", dest="auto_align_temperatures", action="store_false", help="Disable automatic student variance matching")
     parser.add_argument("--t-teacher-mp", type=float, default=None, help="Teacher shaping temperature for MovePicker (default from config or 0.50)")
     parser.add_argument("--t-teacher-lmr", type=float, default=None, help="Teacher shaping temperature for LMR (default from config or 1.00)")
-    parser.add_argument("--tau-student-mp", type=float, default=None, help="Student logit scale temperature for MovePicker (default from config or 0.1154)")
-    parser.add_argument("--tau-student-lmr", type=float, default=None, help="Student reduction scale temperature for LMR (default from config or 0.8658)")
+    parser.add_argument("--tau-student-mp", type=float, default=None, help="Student logit scale temperature for MovePicker (default: auto variance-matched)")
+    parser.add_argument("--tau-student-lmr", type=float, default=None, help="Student reduction scale temperature for LMR (default: auto variance-matched)")
     parser.add_argument("--output", type=str, default="floored_dual_64it.miniNN", help="Output model binary path")
 
     args = parser.parse_args()
@@ -1513,7 +1579,7 @@ def main():
     print(f"Total Iterations:            {args.iterations:,}", flush=True)
     print(f"Off-Policy Warmup Iterations:{args.offpolicy_iterations:>8d} (Master handcrafted search replay buffer)", flush=True)
     print(f"Validation Frequency:        Every {args.val_freq} iterations", flush=True)
-    print(f"Validation Rollout Size:     {args.val_samples:,} samples (2^15)", flush=True)
+    print(f"Validation Rollout Target:   {args.val_samples:,} samples (2^15)", flush=True)
     print(f"Validation FEN Pool:         {args.val_fens_pool:,} FENs (drawn from 500k stream)", flush=True)
     print(f"Heldout Test FEN Pool:       {args.test_fens_pool:,} FENs (unseen test set)", flush=True)
     print(f"Rollout Buffer Size / Iter:  {args.rollout_samples:,} transitions", flush=True)
@@ -1521,7 +1587,6 @@ def main():
     print(f"Mini-Batch Size:             {args.minibatch_size}", flush=True)
     print(f"PPO Multi-Epochs / Iter:     {args.ppo_epochs} epochs ({args.ppo_epochs * math.ceil(args.rollout_samples / args.minibatch_size)} gradient steps/iter)", flush=True)
     print(f"Teacher Targets Shaping:     MP T = {t_teacher_mp:.4f} (Floor: {floor_mp:.3f}) | LMR T = {t_teacher_lmr:.4f} (Floor: {floor_lmr:.3f})", flush=True)
-    print(f"Student Scaling Scale:       MP tau = {tau_student_mp:.4f} | LMR tau = {tau_student_lmr:.4f}", flush=True)
     print(f"Nodes per FEN Search:        {args.nodes:,}", flush=True)
     print("=" * 80, flush=True)
 
@@ -1534,7 +1599,7 @@ def main():
         seed=42
     )
 
-    print(f"[1/3] Loading / Generating Fixed {args.val_samples:,} Validation Rollout Samples (evenly from {len(val_fens_pool):,} FENs)...", flush=True)
+    print(f"[1/3] Loading / Generating Validation Rollout (evenly from {len(val_fens_pool):,} FENs, target max {args.val_samples:,})...", flush=True)
     t_v0 = time.time()
 
     val_tel, val_db = collect_validation_rollout_even(
@@ -1554,7 +1619,17 @@ def main():
         t_teacher_mp=t_teacher_mp
     )
     val_loader = DataLoader(val_dataset, batch_size=args.minibatch_size, shuffle=False)
-    print(f"      Validation set ready: {len(val_dataset):,} samples in {time.time() - t_v0:.1f}s.\n", flush=True)
+    print(f"      Validation set ready: {len(val_dataset):,} transitions (sampled across {len(val_fens_pool):,} FENs) in {time.time() - t_v0:.1f}s.", flush=True)
+
+    matched_tau_mp, matched_tau_lmr = val_dataset.compute_variance_matched_temperatures()
+    if args.auto_align_temperatures:
+        if args.tau_student_mp is None:
+            tau_student_mp = matched_tau_mp
+        if args.tau_student_lmr is None:
+            tau_student_lmr = matched_tau_lmr
+        print(f"      Auto-Aligned Student Scales (Logit Variance Matching): MP tau = {tau_student_mp:.4f} | LMR tau = {tau_student_lmr:.4f}\n", flush=True)
+    else:
+        print(f"      Configured Student Scales: MP tau = {tau_student_mp:.4f} | LMR tau = {tau_student_lmr:.4f} (Empirical Match: MP={matched_tau_mp:.4f}, LMR={matched_tau_lmr:.4f})\n", flush=True)
 
     offpolicy_dataset = None
     if args.offpolicy_iterations > 0:
