@@ -56,19 +56,26 @@ from model import DualMiniNN
 from paths import CACHE_DIR, CALIB_CONFIG_PATH, EPD_FILE, MONTY_BIN, STOCKFISH_BIN
 
 
-def load_calibration_parameters() -> Tuple[float, float, float, float]:
+def load_calibration_parameters() -> Tuple[float, float, float, float, float, float]:
+    t_teacher_lmr = 1.00
+    t_teacher_mp = 0.50
+    tau_student_lmr = 0.8658
+    tau_student_mp = 0.1154
+    floor_lmr = 0.050
+    floor_mp = 0.010
     if os.path.exists(CALIB_CONFIG_PATH):
         try:
             with open(CALIB_CONFIG_PATH, "r") as f:
                 cfg = json.load(f)
-            t_lmr = float(cfg.get("t_calib_lmr", 1.5))
-            t_mp = float(cfg.get("t_calib_mp", 0.5))
-            floor_lmr = float(cfg.get("chosen_floor_lmr", 0.10))
+            t_teacher_lmr = float(cfg.get("t_teacher_lmr", cfg.get("t_calib_lmr", 1.00)))
+            t_teacher_mp = float(cfg.get("t_teacher_mp", cfg.get("t_calib_mp", 0.50)))
+            tau_student_lmr = float(cfg.get("tau_student_lmr", cfg.get("t_calib_lmr", 0.8658)))
+            tau_student_mp = float(cfg.get("tau_student_mp", cfg.get("t_calib_mp", 0.1154)))
+            floor_lmr = float(cfg.get("chosen_floor_lmr", 0.050))
             floor_mp = float(cfg.get("chosen_floor_mp", 0.010))
-            return t_lmr, t_mp, floor_lmr, floor_mp
         except Exception:
             pass
-    return 1.5, 0.5, 0.10, 0.010
+    return t_teacher_lmr, t_teacher_mp, tau_student_lmr, tau_student_mp, floor_lmr, floor_mp
 
 
 def load_and_subsample_fens(
@@ -280,15 +287,17 @@ class RolloutDataset(Dataset):
         self,
         telemetry_path: str,
         monty_db_path: str,
-        floor_lmr: float = 0.010,
+        floor_lmr: float = 0.050,
         floor_mp: float = 0.010,
-        t_lmr: float = 0.8658,
-        t_mp: float = 0.1154
+        t_teacher_lmr: float = 1.00,
+        t_teacher_mp: float = 0.50,
+        t_lmr: Optional[float] = None,
+        t_mp: Optional[float] = None
     ):
         self.floor_lmr = floor_lmr
         self.floor_mp = floor_mp
-        self.t_lmr = t_lmr
-        self.t_mp = t_mp
+        self.t_teacher_lmr = t_lmr if t_lmr is not None else t_teacher_lmr
+        self.t_teacher_mp = t_mp if t_mp is not None else t_teacher_mp
         self.items = []
 
         conn = sqlite3.connect(monty_db_path)
@@ -392,15 +401,15 @@ class RolloutDataset(Dataset):
 
                 if raw_p_list:
                     p_arr = np.array(raw_p_list, dtype=np.float64)
-                    # 1. MovePicker Target (T_mp = 0.5, q_mp = 0.01)
-                    log_mp = np.log(p_arr + 1e-12) / self.t_mp
+                    # 1. MovePicker Target (Teacher softening)
+                    log_mp = np.log(p_arr + 1e-12) / self.t_teacher_mp
                     exp_mp = np.exp(log_mp - np.max(log_mp))
                     p_temp_mp = exp_mp / np.sum(exp_mp)
                     p_target_mp = (1.0 - self.floor_mp) * p_temp_mp + self.floor_mp / float(num_moves)
                     target_p_mp[:num_moves] = torch.from_numpy(p_target_mp).float()
 
-                    # 2. LMR Target (T_lmr = 1.5, q_lmr = 0.10)
-                    log_lmr = np.log(p_arr + 1e-12) / self.t_lmr
+                    # 2. LMR Target (Teacher softening)
+                    log_lmr = np.log(p_arr + 1e-12) / self.t_teacher_lmr
                     exp_lmr = np.exp(log_lmr - np.max(log_lmr))
                     p_temp_lmr = exp_lmr / np.sum(exp_lmr)
                     p_target_lmr = (1.0 - self.floor_lmr) * p_temp_lmr + self.floor_lmr / float(num_moves)
@@ -1180,21 +1189,21 @@ def run_heldout_online_evaluation(
             merge_worker_dbs(db_path, worker_db_paths)
 
     # 3. Load heldout rollout dataset and evaluate standardized metrics
-    t_lmr_calib, t_mp_calib, floor_lmr_calib, floor_mp_calib = load_calibration_parameters()
+    t_teacher_lmr_calib, t_teacher_mp_calib, tau_student_lmr_calib, tau_student_mp_calib, floor_lmr_calib, floor_mp_calib = load_calibration_parameters()
     heldout_dataset = RolloutDataset(
         telemetry_path=tel_path,
         monty_db_path=db_path,
         floor_lmr=floor_lmr_calib,
         floor_mp=floor_mp_calib,
-        t_lmr=t_lmr_calib,
-        t_mp=t_mp_calib
+        t_teacher_lmr=t_teacher_lmr_calib,
+        t_teacher_mp=t_teacher_mp_calib
     )
     heldout_loader = DataLoader(heldout_dataset, batch_size=256, shuffle=False)
 
     if model is None:
-        heldout_stats = evaluate_handcrafted_master(heldout_loader)
+        heldout_stats = evaluate_handcrafted_master(heldout_loader, tau_mp=tau_student_mp_calib, tau_lmr=tau_student_lmr_calib)
     else:
-        heldout_stats = evaluate_validation_rollout(model, heldout_loader)
+        heldout_stats = evaluate_validation_rollout(model, heldout_loader, tau_lmr=tau_student_lmr_calib)
 
     print_unified_benchmark_report("Neural MiniNN Heldout Test Set (1,000 FENs)", heldout_stats)
 
@@ -1210,13 +1219,15 @@ def train_single_run(
     mp_anchor_coef: float,
     lmr_ord_coef: float,
     rank_profile_coef: float,
-    args,
+    args: argparse.Namespace,
     val_loader: DataLoader,
     val_dataset: RolloutDataset,
     train_fens_pool: List[str],
     test_fens_pool: List[str],
-    t_lmr: float,
-    t_mp: float,
+    t_teacher_lmr: float,
+    t_teacher_mp: float,
+    tau_student_lmr: float,
+    tau_student_mp: float,
     floor_lmr: float,
     floor_mp: float,
     output_path: str,
@@ -1225,21 +1236,24 @@ def train_single_run(
     print("\n" + "=" * 80, flush=True)
     print(f"   STARTING RUN: {run_name}", flush=True)
     print("=" * 80, flush=True)
-    print(f"Iterations:                 {args.iterations:,}", flush=True)
+    print(f"Iterations:                 {args.iterations}", flush=True)
     print(f"Off-Policy Warmup:          {args.offpolicy_iterations} iters (Master replay buffer)", flush=True)
     print(f"Peak Learning Rate:         {lr:.4e}", flush=True)
-    print(f"LR Schedule:                Warmup (min 2 iters) -> Cosine Decay (Floor: {0.30 * lr:.4e})", flush=True)
-    print(f"Rollout Buffer Size:        {args.rollout_samples}", flush=True)
+    print(f"LR Schedule:                Warmup (min 2 iters) -> Cosine Decay (Floor: {lr * 0.30:.4e})", flush=True)
+    print(f"Rollout Buffer Size:        {args.rollout_samples:,}", flush=True)
+    print(f"Replay Window:              {args.replay_window_iters} iters ({args.replay_window_iters * args.rollout_samples:,} total window samples)", flush=True)
     print(f"Mini-Batch Size:            {args.minibatch_size}", flush=True)
     print(f"PPO Multi-Epochs / Iter:    {args.ppo_epochs}", flush=True)
     print(f"MovePicker Anchor Coef:     {mp_anchor_coef:.2f}", flush=True)
     print(f"LMR Policy KL Coef:         {lmr_ord_coef:.2f}", flush=True)
     print(f"Rank-Profile MSE Coef:      {rank_profile_coef:.2f}", flush=True)
+    print(f"Teacher Temperatures:       MP: {t_teacher_mp:.4f} | LMR: {t_teacher_lmr:.4f}", flush=True)
+    print(f"Student Temperatures:       MP: {tau_student_mp:.4f} | LMR: {tau_student_lmr:.4f}", flush=True)
     print(f"Output Binary:              {output_path}", flush=True)
     print("=" * 80, flush=True)
 
     if args.offpolicy_iterations > 0 and offpolicy_dataset is None:
-        total_offpolicy_needed = max(8192, args.offpolicy_iterations * args.rollout_samples)
+        total_offpolicy_needed = max(16384, args.offpolicy_iterations * args.rollout_samples)
         offpolicy_tel, offpolicy_db = collect_or_load_offpolicy_buffer(
             train_fens_pool=train_fens_pool,
             target_samples=total_offpolicy_needed,
@@ -1253,8 +1267,8 @@ def train_single_run(
             monty_db_path=offpolicy_db,
             floor_lmr=floor_lmr,
             floor_mp=floor_mp,
-            t_lmr=t_lmr,
-            t_mp=t_mp
+            t_teacher_lmr=t_teacher_lmr,
+            t_teacher_mp=t_teacher_mp
         )
 
     train_mode = getattr(args, "train_mode", "both")
@@ -1262,7 +1276,7 @@ def train_single_run(
     use_lmr = (train_mode != "movepicker")
     mode_str = "MovePicker Only" if train_mode == "movepicker" else ("LMR Only" if train_mode == "lmr" else "Dual MP+LMR")
 
-    model = DualMiniNN()
+    model = DualMiniNN(tau_mp_base=tau_student_mp, tau_lmr_base=tau_student_lmr)
     model.export_quantized_binary(output_path)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
@@ -1281,6 +1295,7 @@ def train_single_run(
 
     curr_fen_offset = 0
     total_gradient_steps = 0
+    onpolicy_datasets_window = []
 
     for iteration in range(1, args.iterations + 1):
         t0 = time.time()
@@ -1289,11 +1304,18 @@ def train_single_run(
         if is_offpolicy:
             phase_tag = "Off-Policy"
             buf_len = len(offpolicy_dataset)
-            start_idx = ((iteration - 1) * args.rollout_samples) % buf_len
-            indices = [(start_idx + i) % buf_len for i in range(args.rollout_samples)]
+            indices = torch.randperm(buf_len)[:min(buf_len, args.rollout_samples)].tolist()
             iter_subset = torch.utils.data.Subset(offpolicy_dataset, indices)
             train_loader = DataLoader(iter_subset, batch_size=args.minibatch_size, shuffle=True)
             fresh_tel, fresh_db = "", ""
+
+            # Vectorized Live Stats pass on off-policy batch
+            fresh_loader = DataLoader(iter_subset, batch_size=len(iter_subset), shuffle=False)
+            live_stats = evaluate_validation_rollout(
+                model, fresh_loader,
+                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef,
+                tau_lmr=tau_student_lmr, train_mode=train_mode
+            )
         else:
             if iteration == args.offpolicy_iterations + 1 and args.offpolicy_iterations > 0:
                 print("\n" + "=" * 80, flush=True)
@@ -1314,14 +1336,39 @@ def train_single_run(
                 use_lmr=use_lmr
             )
 
-            train_dataset = RolloutDataset(
+            curr_dataset = RolloutDataset(
                 telemetry_path=fresh_tel,
                 monty_db_path=fresh_db,
                 floor_lmr=floor_lmr,
                 floor_mp=floor_mp,
-                t_lmr=t_lmr,
-                t_mp=t_mp
+                t_teacher_lmr=t_teacher_lmr,
+                t_teacher_mp=t_teacher_mp
             )
+
+            # Vectorized Live Stats pass on fresh on-policy rollout (Zero Extra Cost)
+            fresh_loader = DataLoader(curr_dataset, batch_size=len(curr_dataset), shuffle=False)
+            live_stats = evaluate_validation_rollout(
+                model, fresh_loader,
+                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef,
+                tau_lmr=tau_student_lmr, train_mode=train_mode
+            )
+
+            # Maintain sliding replay window across iterations
+            onpolicy_datasets_window.append((curr_dataset, fresh_tel, fresh_db))
+            if len(onpolicy_datasets_window) > args.replay_window_iters:
+                old_ds, old_tel, old_db = onpolicy_datasets_window.pop(0)
+                try:
+                    if old_tel and os.path.exists(old_tel):
+                        os.remove(old_tel)
+                    if old_db and os.path.exists(old_db):
+                        os.remove(old_db)
+                except Exception:
+                    pass
+
+            if len(onpolicy_datasets_window) == 1:
+                train_dataset = onpolicy_datasets_window[0][0]
+            else:
+                train_dataset = torch.utils.data.ConcatDataset([d[0] for d in onpolicy_datasets_window])
             train_loader = DataLoader(train_dataset, batch_size=args.minibatch_size, shuffle=True)
 
         iter_steps = 0
@@ -1355,39 +1402,46 @@ def train_single_run(
                 if total_gradient_steps % args.sync_interval == 0:
                     model.export_quantized_binary(output_path)
 
-        if not is_offpolicy:
-            try:
-                if fresh_tel and os.path.exists(fresh_tel):
-                    os.remove(fresh_tel)
-                if fresh_db and os.path.exists(fresh_db):
-                    os.remove(fresh_db)
-            except Exception:
-                pass
-
         elapsed_iter = time.time() - t0
         curr_lr = scheduler.get_last_lr()[0]
         n_steps = max(1, iter_steps)
 
+        live_str = f"Live Search: Top1:{live_stats['top1_match']:4.1f}% (Q:{live_stats['quiet_top1']:4.1f}%, C:{live_stats['cap_top1']:4.1f}%)"
+        if train_mode != "movepicker":
+            live_str += f", RedTop1:{live_stats['top1_reduction']:4.2f}p, RedLate:{live_stats['late_reduction']:4.2f}p"
+
         if iteration % args.val_freq == 0 or iteration == 1 or iteration == args.iterations:
             val_stats = evaluate_validation_rollout(
                 model, val_loader,
-                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, train_mode=train_mode
+                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef,
+                tau_lmr=tau_student_lmr, train_mode=train_mode
             )
             print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag} | {mode_str})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
-                  f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Pol: {iter_lmr_ord/n_steps:.3f}) | "
-                  f"Val MP: (Q:{val_stats['quiet_top1']:5.2f}%, C:{val_stats['cap_top1']:5.2f}%) | Val Alloc Q(i*): {val_stats['q_search_star']:5.2f}% | Effort: {val_stats['mean_effort']:.3f} | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
+                  f"Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR: {iter_lmr_ord/n_steps:.3f}) | "
+                  f"{live_str} | Val MP: (Q:{val_stats['quiet_top1']:4.1f}%, C:{val_stats['cap_top1']:4.1f}%) | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
         else:
             print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag} | {mode_str})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
-                  f"Train Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR_Pol: {iter_lmr_ord/n_steps:.3f})", flush=True)
+                  f"Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR: {iter_lmr_ord/n_steps:.3f}) | {live_str}", flush=True)
+
+    # Clean up any remaining sliding window temp files
+    for _, old_tel, old_db in onpolicy_datasets_window:
+        try:
+            if old_tel and os.path.exists(old_tel):
+                os.remove(old_tel)
+            if old_db and os.path.exists(old_db):
+                os.remove(old_db)
+        except Exception:
+            pass
 
     final_stats = evaluate_validation_rollout(
         model, val_loader,
-        mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, train_mode=train_mode
+        mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef,
+        tau_lmr=tau_student_lmr, train_mode=train_mode
     )
     model.export_quantized_binary(output_path)
 
     # Output detailed 2D Depth x Rank Evaluation Matrix
-    evaluate_2d_depth_rank_matrix(model, val_loader, tau_lmr=t_lmr)
+    evaluate_2d_depth_rank_matrix(model, val_loader, tau_lmr=tau_student_lmr)
 
     # Final Online Testing Step on Heldout FENs (Matching val_samples scale)
     if test_fens_pool:
@@ -1413,9 +1467,10 @@ def main():
     parser.add_argument("--train-mode", type=str, choices=["both", "movepicker", "lmr"], default="both", help="Training mode: 'movepicker' (MP only, Master LMR), 'lmr' (LMR only, Master MP), 'both' (dual joint MP+LMR) (default: both)")
     parser.add_argument("--movepicker-only", action="store_true", help="Shortcut for --train-mode movepicker")
     parser.add_argument("--lmr-only", action="store_true", help="Shortcut for --train-mode lmr")
-    parser.add_argument("--rollout-samples", type=int, default=512, help="Fresh on-policy rollout buffer size per iteration (default: 512)")
-    parser.add_argument("--minibatch-size", type=int, default=64, help="Minibatch size for SGD updates (default: 64)")
-    parser.add_argument("--ppo-epochs", type=int, default=4, help="PPO multi-epoch passes over fresh rollout buffer (default: 4)")
+    parser.add_argument("--rollout-samples", "--replay-buffer-size", dest="rollout_samples", type=int, default=4096, help="Fresh on-policy rollout buffer size per iteration (default: 4096)")
+    parser.add_argument("--replay-window-iters", type=int, default=4, help="Sliding replay window in iterations (accumulates last K iterations for training) (default: 4)")
+    parser.add_argument("--minibatch-size", type=int, default=256, help="Minibatch size for SGD updates (default: 256)")
+    parser.add_argument("--ppo-epochs", type=int, default=8, help="PPO multi-epoch passes over fresh rollout buffer (default: 8)")
     parser.add_argument("--sync-interval", type=int, default=4, help="Gradient steps between model syncs (default: 4)")
     parser.add_argument("--val-freq", type=int, default=8, help="Validation frequency (default: 8)")
     parser.add_argument("--val-samples", type=int, default=32768, help="Fixed validation rollout samples (default: 32768 = 2^15)")
@@ -1431,6 +1486,10 @@ def main():
     parser.add_argument("--mp-anchor-coef", type=float, default=0.20, help="MovePicker anchor weight (default: 0.20)")
     parser.add_argument("--lmr-ord-coef", type=float, default=0.40, help="LMR policy cross-entropy weight (default: 0.40)")
     parser.add_argument("--rank-profile-coef", type=float, default=0.40, help="Rank profile MSE loss weight (default: 0.40)")
+    parser.add_argument("--t-teacher-mp", type=float, default=None, help="Teacher shaping temperature for MovePicker (default from config or 0.50)")
+    parser.add_argument("--t-teacher-lmr", type=float, default=None, help="Teacher shaping temperature for LMR (default from config or 1.00)")
+    parser.add_argument("--tau-student-mp", type=float, default=None, help="Student logit scale temperature for MovePicker (default from config or 0.1154)")
+    parser.add_argument("--tau-student-lmr", type=float, default=None, help="Student reduction scale temperature for LMR (default from config or 0.8658)")
     parser.add_argument("--output", type=str, default="floored_dual_64it.miniNN", help="Output model binary path")
 
     args = parser.parse_args()
@@ -1439,7 +1498,11 @@ def main():
     elif args.lmr_only:
         args.train_mode = "lmr"
 
-    t_lmr, t_mp, floor_lmr, floor_mp = load_calibration_parameters()
+    t_teacher_lmr_cfg, t_teacher_mp_cfg, tau_student_lmr_cfg, tau_student_mp_cfg, floor_lmr, floor_mp = load_calibration_parameters()
+    t_teacher_lmr = args.t_teacher_lmr if args.t_teacher_lmr is not None else t_teacher_lmr_cfg
+    t_teacher_mp = args.t_teacher_mp if args.t_teacher_mp is not None else t_teacher_mp_cfg
+    tau_student_lmr = args.tau_student_lmr if args.tau_student_lmr is not None else tau_student_lmr_cfg
+    tau_student_mp = args.tau_student_mp if args.tau_student_mp is not None else tau_student_mp_cfg
 
     mode_display = "MovePicker Only (Master LMR)" if args.train_mode == "movepicker" else ("LMR Only (Master MovePicker)" if args.train_mode == "lmr" else "Dual (MovePicker + LMR)")
 
@@ -1453,11 +1516,12 @@ def main():
     print(f"Validation Rollout Size:     {args.val_samples:,} samples (2^15)", flush=True)
     print(f"Validation FEN Pool:         {args.val_fens_pool:,} FENs (drawn from 500k stream)", flush=True)
     print(f"Heldout Test FEN Pool:       {args.test_fens_pool:,} FENs (unseen test set)", flush=True)
-    print(f"Rollout Buffer Size / Iter:  {args.rollout_samples} transitions", flush=True)
+    print(f"Rollout Buffer Size / Iter:  {args.rollout_samples:,} transitions", flush=True)
+    print(f"Replay Window (Phase 2):     {args.replay_window_iters} iterations ({args.replay_window_iters * args.rollout_samples:,} transitions window)", flush=True)
     print(f"Mini-Batch Size:             {args.minibatch_size}", flush=True)
     print(f"PPO Multi-Epochs / Iter:     {args.ppo_epochs} epochs ({args.ppo_epochs * math.ceil(args.rollout_samples / args.minibatch_size)} gradient steps/iter)", flush=True)
-    print(f"LMR Calibration Target:      T_calib = {t_lmr:.4f} | Floor = {floor_lmr:.3f}", flush=True)
-    print(f"MP Calibration Target:       T_calib = {t_mp:.4f} | Floor = {floor_mp:.3f}", flush=True)
+    print(f"Teacher Targets Shaping:     MP T = {t_teacher_mp:.4f} (Floor: {floor_mp:.3f}) | LMR T = {t_teacher_lmr:.4f} (Floor: {floor_lmr:.3f})", flush=True)
+    print(f"Student Scaling Scale:       MP tau = {tau_student_mp:.4f} | LMR tau = {tau_student_lmr:.4f}", flush=True)
     print(f"Nodes per FEN Search:        {args.nodes:,}", flush=True)
     print("=" * 80, flush=True)
 
@@ -1486,15 +1550,15 @@ def main():
         monty_db_path=val_db,
         floor_lmr=floor_lmr,
         floor_mp=floor_mp,
-        t_lmr=t_lmr,
-        t_mp=t_mp
+        t_teacher_lmr=t_teacher_lmr,
+        t_teacher_mp=t_teacher_mp
     )
     val_loader = DataLoader(val_dataset, batch_size=args.minibatch_size, shuffle=False)
     print(f"      Validation set ready: {len(val_dataset):,} samples in {time.time() - t_v0:.1f}s.\n", flush=True)
 
     offpolicy_dataset = None
     if args.offpolicy_iterations > 0:
-        total_offpolicy_needed = max(8192, args.offpolicy_iterations * args.rollout_samples)
+        total_offpolicy_needed = max(16384, args.offpolicy_iterations * args.rollout_samples)
         print(f"[2/3] Loading / Generating Master Off-Policy Replay Buffer ({total_offpolicy_needed:,} samples for {args.offpolicy_iterations} warmup iterations)...", flush=True)
         t_op0 = time.time()
         offpolicy_tel, offpolicy_db = collect_or_load_offpolicy_buffer(
@@ -1510,15 +1574,15 @@ def main():
             monty_db_path=offpolicy_db,
             floor_lmr=floor_lmr,
             floor_mp=floor_mp,
-            t_lmr=t_lmr,
-            t_mp=t_mp
+            t_teacher_lmr=t_teacher_lmr,
+            t_teacher_mp=t_teacher_mp
         )
         print(f"      Master off-policy replay buffer ready: {len(offpolicy_dataset):,} samples in {time.time() - t_op0:.1f}s.\n", flush=True)
     else:
         print(f"[2/3] Skipping Master Off-Policy Replay Buffer (pure on-policy mode).\n", flush=True)
 
     # Master Baseline Evaluation on Fixed 2^15 Validation Set
-    master_stats = evaluate_handcrafted_master(val_loader, tau_mp=t_mp, tau_lmr=t_lmr)
+    master_stats = evaluate_handcrafted_master(val_loader, tau_mp=tau_student_mp, tau_lmr=tau_student_lmr)
     print_unified_benchmark_report("Handcrafted Stockfish Master Baseline", master_stats)
 
     if args.grid:
@@ -1546,8 +1610,10 @@ def main():
                 val_dataset=val_dataset,
                 train_fens_pool=train_fens_pool,
                 test_fens_pool=test_fens_pool,
-                t_lmr=t_lmr,
-                t_mp=t_mp,
+                t_teacher_lmr=t_teacher_lmr,
+                t_teacher_mp=t_teacher_mp,
+                tau_student_lmr=tau_student_lmr,
+                tau_student_mp=tau_student_mp,
                 floor_lmr=floor_lmr,
                 floor_mp=floor_mp,
                 output_path=cfg["output"],
@@ -1593,8 +1659,10 @@ def main():
             val_dataset=val_dataset,
             train_fens_pool=train_fens_pool,
             test_fens_pool=test_fens_pool,
-            t_lmr=t_lmr,
-            t_mp=t_mp,
+            t_teacher_lmr=t_teacher_lmr,
+            t_teacher_mp=t_teacher_mp,
+            tau_student_lmr=tau_student_lmr,
+            tau_student_mp=tau_student_mp,
             floor_lmr=floor_lmr,
             floor_mp=floor_mp,
             output_path=args.output,
