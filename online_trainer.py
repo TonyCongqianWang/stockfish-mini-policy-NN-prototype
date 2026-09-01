@@ -393,14 +393,18 @@ class RolloutDataset(Dataset):
                     is_cap_mask[i] = is_capture
                     legal_mask[i] = True
 
-                    if i == 0 or rank == 1:
-                        base_red = 0.0
-                        legacy_reduction = 0.0
+                    if "r_base" in m_data:
+                        r_base[i] = float(m_data["r_base"]) / 1024.0
+                        r_legacy[i] = float(m_data["r_base"]) / 1024.0
                     else:
-                        base_red = (math.log(max(1, depth)) * math.log(max(1, rank)) * 500.0) / 1024.0
-                        legacy_reduction = (math.log(max(1, depth)) * math.log(max(1, rank)) * 500.0 - stat_score * (439.0 / 4096.0)) / 1024.0
-                    r_base[i] = base_red
-                    r_legacy[i] = legacy_reduction
+                        if i == 0 or rank == 1:
+                            base_red = 0.0
+                            legacy_reduction = 0.0
+                        else:
+                            base_red = (math.log(max(1, depth)) * math.log(max(1, rank)) * 500.0) / 1024.0
+                            legacy_reduction = (math.log(max(1, depth)) * math.log(max(1, rank)) * 500.0 - stat_score * (439.0 / 4096.0)) / 1024.0
+                        r_base[i] = base_red
+                        r_legacy[i] = legacy_reduction
                     z_legacy_mp[i] = float(np.clip(stat_score / 16384.0, -1.0, 1.0))
 
                     raw_p = m_policy.get(uci_str, 0.0)
@@ -1061,9 +1065,11 @@ def collect_target_samples(
 
     curr_ptr = fen_offset
     all_lines = []
+    samples_per_fen_est = 40.0
 
     while len(all_lines) < target_samples:
-        batch_fens_count = max(30, int(math.ceil((target_samples - len(all_lines)) / 40)))
+        needed = target_samples - len(all_lines)
+        batch_fens_count = max(workers * 2, int(math.ceil(needed / samples_per_fen_est)))
         fens_slice = [fens_pool[(curr_ptr + i) % len(fens_pool)] for i in range(batch_fens_count)]
         curr_ptr += batch_fens_count
 
@@ -1624,7 +1630,7 @@ def main():
 
     offpolicy_dataset = None
     if args.offpolicy_iterations > 0:
-        total_offpolicy_needed = max(16384, args.offpolicy_iterations * args.rollout_samples)
+        total_offpolicy_needed = args.offpolicy_iterations * args.rollout_samples
         print(f"[2/3] Loading / Generating Master Off-Policy Replay Buffer ({total_offpolicy_needed:,} samples for {args.offpolicy_iterations} warmup iterations)...", flush=True)
         t_op0 = time.time()
         offpolicy_tel, offpolicy_db = collect_or_load_offpolicy_buffer(

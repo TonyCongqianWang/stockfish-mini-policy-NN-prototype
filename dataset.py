@@ -74,7 +74,9 @@ def extract_node_features_from_data(s: dict) -> Optional[torch.Tensor]:
 
 def extract_quiet_terms_from_data(m_data: dict, ply: int = 16) -> torch.Tensor:
     t = np.zeros(10, dtype=np.float32)
-    if "x_quiet" in m_data and len(m_data["x_quiet"]) >= 10:
+    if "t_quiet" in m_data and len(m_data["t_quiet"]) >= 10:
+        t = np.array(m_data["t_quiet"][:10], dtype=np.float32)
+    elif "x_quiet" in m_data and len(m_data["x_quiet"]) >= 10:
         xq = np.array(m_data["x_quiet"][:10], dtype=np.float32)
         t[0] = xq[0] * 512.0                  # 2 * mainHistory
         t[1] = xq[1] * 512.0                  # 2 * pawnHistory
