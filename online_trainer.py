@@ -43,14 +43,10 @@ from torch.utils.data import DataLoader, Dataset
 
 from dataset import (
     MAX_LEGAL_MOVES,
-    extract_capture_features_from_data,
-    extract_capture_raw_features,
     extract_lmr_features_from_data,
-    extract_lmr_raw_features,
     extract_node_features,
     extract_node_features_from_data,
-    extract_quiet_features,
-    extract_quiet_features_from_data,
+    extract_quiet_terms_from_data,
 )
 from model import DualMiniNN
 from paths import CACHE_DIR, CALIB_CONFIG_PATH, EPD_FILE, MONTY_BIN, STOCKFISH_BIN
@@ -282,6 +278,28 @@ def merge_worker_dbs(main_db_path: str, worker_db_paths: List[str]):
     conn.close()
 
 
+def load_calibration_parameters() -> Tuple[float, float, float, float, float, float]:
+    t_teacher_lmr = 1.00
+    t_teacher_mp = 0.50
+    tau_student_lmr = 0.8658
+    tau_student_mp = 0.1154
+    floor_lmr = 0.050
+    floor_mp = 0.010
+    if os.path.exists(CALIB_CONFIG_PATH):
+        try:
+            with open(CALIB_CONFIG_PATH, "r") as f:
+                cfg = json.load(f)
+            t_teacher_lmr = float(cfg.get("t_teacher_lmr", cfg.get("t_calib_lmr", 1.00)))
+            t_teacher_mp = float(cfg.get("t_teacher_mp", cfg.get("t_calib_mp", 0.50)))
+            tau_student_lmr = float(cfg.get("tau_student_lmr", cfg.get("t_calib_lmr", 0.8658)))
+            tau_student_mp = float(cfg.get("tau_student_mp", cfg.get("t_calib_mp", 0.1154)))
+            floor_lmr = float(cfg.get("chosen_floor_lmr", 0.050))
+            floor_mp = float(cfg.get("chosen_floor_mp", 0.010))
+        except Exception:
+            pass
+    return t_teacher_lmr, t_teacher_mp, tau_student_lmr, tau_student_mp, floor_lmr, floor_mp
+
+
 class RolloutDataset(Dataset):
     def __init__(
         self,
@@ -301,8 +319,6 @@ class RolloutDataset(Dataset):
         self.items = []
 
         conn = sqlite3.connect(monty_db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT fen FROM policies")
         cursor = conn.cursor()
         cursor.execute("SELECT fen, policy_json FROM policies")
         policies = {row[0]: json.loads(row[1]) for row in cursor.fetchall()}
@@ -332,7 +348,6 @@ class RolloutDataset(Dataset):
                 except Exception:
                     continue
 
-                # Depth-Independent Node Features (with cut_node and pv_node)
                 u_node = extract_node_features_from_data(s)
                 if u_node is None:
                     prev_stat_score = s.get("prev_stat_score", 0)
@@ -352,8 +367,7 @@ class RolloutDataset(Dataset):
                 if num_moves < 3:
                     continue
 
-                x_quiet = torch.zeros(MAX_LEGAL_MOVES, 12, dtype=torch.float32)
-                x_cap = torch.zeros(MAX_LEGAL_MOVES, 4, dtype=torch.float32)
+                t_quiet = torch.zeros(MAX_LEGAL_MOVES, 10, dtype=torch.float32)
                 x_lmr = torch.zeros(MAX_LEGAL_MOVES, 8, dtype=torch.float32)
                 is_cap_mask = torch.zeros(MAX_LEGAL_MOVES, dtype=torch.bool)
                 legal_mask = torch.zeros(MAX_LEGAL_MOVES, dtype=torch.bool)
@@ -373,15 +387,8 @@ class RolloutDataset(Dataset):
                     is_capture = m_data.get("is_capture", False)
                     rank = m_data.get("picker_rank", i + 1)
 
-                    try:
-                        x_quiet[i] = extract_quiet_features_from_data(m_data, ply=ply)
-                        x_cap[i] = extract_capture_features_from_data(m_data)
-                        x_lmr[i] = extract_lmr_features_from_data(m_data)
-                    except Exception:
-                        move_obj = chess.Move.from_uci(uci_str)
-                        x_quiet[i] = extract_quiet_features(board, move_obj, stat_score=stat_score, ply=ply)
-                        x_cap[i] = extract_capture_raw_features(board, move_obj, stat_score=stat_score)
-                        x_lmr[i] = extract_lmr_raw_features(board, move_obj, stat_score=stat_score, rank=rank)
+                    t_quiet[i] = extract_quiet_terms_from_data(m_data, ply=ply)
+                    x_lmr[i] = extract_lmr_features_from_data(m_data)
 
                     is_cap_mask[i] = is_capture
                     legal_mask[i] = True
@@ -401,14 +408,12 @@ class RolloutDataset(Dataset):
 
                 if raw_p_list:
                     p_arr = np.array(raw_p_list, dtype=np.float64)
-                    # 1. MovePicker Target (Teacher softening)
                     log_mp = np.log(p_arr + 1e-12) / self.t_teacher_mp
                     exp_mp = np.exp(log_mp - np.max(log_mp))
                     p_temp_mp = exp_mp / np.sum(exp_mp)
                     p_target_mp = (1.0 - self.floor_mp) * p_temp_mp + self.floor_mp / float(num_moves)
                     target_p_mp[:num_moves] = torch.from_numpy(p_target_mp).float()
 
-                    # 2. LMR Target (Teacher softening)
                     log_lmr = np.log(p_arr + 1e-12) / self.t_teacher_lmr
                     exp_lmr = np.exp(log_lmr - np.max(log_lmr))
                     p_temp_lmr = exp_lmr / np.sum(exp_lmr)
@@ -416,7 +421,7 @@ class RolloutDataset(Dataset):
                     target_p_lmr[:num_moves] = torch.from_numpy(p_target_lmr).float()
 
                 depth_tensor = torch.tensor(float(depth), dtype=torch.float32)
-                self.items.append((u_node, x_quiet, x_cap, x_lmr, is_cap_mask, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth_tensor))
+                self.items.append((u_node, t_quiet, x_lmr, is_cap_mask, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth_tensor))
 
     def __len__(self):
         return len(self.items)
@@ -431,7 +436,7 @@ class RolloutDataset(Dataset):
         var_log_p_lmr = []
 
         for item in self.items:
-            u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth = item
+            u_node, t_quiet, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth = item
             m_mask = legal_mask.numpy()
             z_m = z_legacy_mp[m_mask].numpy()
             p_mp_m = target_p_mp[m_mask].numpy()
@@ -459,7 +464,6 @@ class RolloutDataset(Dataset):
 
 def compute_combined_losses(
     z_quiet: torch.Tensor,
-    z_cap: torch.Tensor,
     delta_r_nn: torch.Tensor,
     tau_mp: torch.Tensor,
     tau_lmr: torch.Tensor,
@@ -471,16 +475,17 @@ def compute_combined_losses(
     is_cap_mask: torch.Tensor,
     legal_mask: torch.Tensor,
     depth: torch.Tensor,
-    mp_shape_coef: float = 0.20,
+    w_quiet: Optional[torch.Tensor] = None,
+    mp_anchor_coef: float = 0.05,
     lmr_ord_coef: float = 0.40,
     rank_profile_coef: float = 0.40,
     train_mode: str = "both"
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Computes Direct Physical Search Allocation and Independent Quiet/Capture MovePicker Losses:
+    Computes Direct Physical Search Allocation and Independent Quiet MovePicker Losses:
     1. MovePicker:
-       - Quiets: Monty KL divergence + Shape Loss on quiet moves using z_quiet vs target_p_mp.
-       - Captures: Monty KL divergence + Shape Loss on capture moves using z_cap vs target_p_mp.
+       - Quiets: Monty KL divergence on quiet moves using z_quiet vs normalized target_p_mp (filtered >= 25% mass).
+       - Anchor: L2 anchor on w_quiet multipliers around 1.0 (Master baseline).
     2. Direct Physical Search Allocation (Monty Policy-Weighted KL Divergence):
        - Move 0: Searched at full depth (Effort = 1.00).
        - Moves 1..M-1: Searched with late reductions r_real = clamp(r_base + delta_r_nn, -2.0, depth - 1.0).
@@ -494,60 +499,37 @@ def compute_combined_losses(
     w_raw = torch.clamp(torch.sqrt(depth.clamp(min=1.0) / 8.0), 0.70, 1.40)
     w_depth = w_raw / w_raw.mean()
 
-    # 1. Quiet Moves KL & Top-1 Match (Filtered by minimum Monty mass threshold >= 5%)
+    # 1. Quiet Moves KL & Top-1 Match (Filtered by minimum Monty mass threshold >= 25%)
     quiet_mask = legal_mask & (~is_cap_mask)
     masked_zq = z_quiet.masked_fill(~quiet_mask, -1e4)
     log_probs_q = F.log_softmax(masked_zq / tau_mp, dim=-1)
-    p_q = target_p_mp * quiet_mask.float()
-    w_q_pos = p_q.sum(dim=-1)
-    has_quiets = (w_q_pos >= 0.05) & (quiet_mask.sum(dim=-1) > 1)
+    p_q_raw = target_p_mp * quiet_mask.float()
+    w_q_pos = p_q_raw.sum(dim=-1)
+    has_quiets = (w_q_pos >= 0.25) & (quiet_mask.sum(dim=-1) > 1)
 
     loss_mp_kl_q = torch.tensor(0.0, device=z_quiet.device)
     acc_q = torch.tensor(0.0, device=z_quiet.device)
     if has_quiets.sum() > 0:
-        loss_q_pos = -(p_q[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1)
+        p_q_norm = p_q_raw[has_quiets] / w_q_pos[has_quiets].unsqueeze(1)
+        loss_q_pos = -(p_q_norm * log_probs_q[has_quiets]).sum(dim=-1)
         loss_mp_kl_q = (w_depth[has_quiets] * loss_q_pos).mean()
-        acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q[has_quiets].argmax(dim=-1)).float().mean()
+        acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q_raw[has_quiets].argmax(dim=-1)).float().mean()
 
-    # 2. Capture Moves KL & Top-1 Match (Filtered by minimum Monty mass threshold >= 5%)
-    cap_mask = legal_mask & is_cap_mask
-    masked_zc = z_cap.masked_fill(~cap_mask, -1e4)
-    log_probs_c = F.log_softmax(masked_zc / tau_mp, dim=-1)
-    p_c = target_p_mp * cap_mask.float()
-    w_c_pos = p_c.sum(dim=-1)
-    has_caps = (w_c_pos >= 0.05) & (cap_mask.sum(dim=-1) > 1)
+    # Weight Regularization / Anchor on w_quiet (around 1.0 = Master baseline)
+    loss_w_anchor = torch.tensor(0.0, device=z_quiet.device)
+    if w_quiet is not None:
+        loss_w_anchor = (w_quiet - 1.0).pow(2).mean()
 
-    loss_mp_kl_c = torch.tensor(0.0, device=z_cap.device)
-    acc_c = torch.tensor(0.0, device=z_cap.device)
-    if has_caps.sum() > 0:
-        loss_c_pos = -(p_c[has_caps] * log_probs_c[has_caps]).sum(dim=-1)
-        loss_mp_kl_c = (w_depth[has_caps] * loss_c_pos).mean()
-        acc_c = (masked_zc[has_caps].argmax(dim=-1) == p_c[has_caps].argmax(dim=-1)).float().mean()
+    loss_mp_total = loss_mp_kl_q + mp_anchor_coef * loss_w_anchor
 
-    # Distributional Shape Matching (Mean + Variance for Quiets and Captures)
-    loss_shape_quiet = torch.tensor(0.0, device=z_quiet.device)
-    if quiet_mask.sum() > 1:
-        z_q_nn = z_quiet[quiet_mask]
-        z_q_leg = z_legacy_mp[quiet_mask]
-        loss_shape_quiet = (z_q_nn.mean() - z_q_leg.mean()).pow(2) + (z_q_nn.std() - z_q_leg.std()).pow(2)
-
-    loss_shape_cap = torch.tensor(0.0, device=z_cap.device)
-    if cap_mask.sum() > 1:
-        z_c_nn = z_cap[cap_mask]
-        z_c_leg = z_legacy_mp[cap_mask]
-        loss_shape_cap = (z_c_nn.mean() - z_c_leg.mean()).pow(2) + (z_c_nn.std() - z_c_leg.std()).pow(2)
-
-    loss_mp_shape = loss_shape_quiet + loss_shape_cap
-    loss_mp_total = loss_mp_kl_q + loss_mp_kl_c + mp_shape_coef * loss_mp_shape
-
-    # 3. Residual Reductions on physical moves
+    # 2. Residual Reductions on physical moves
     r_total_nn = r_base + delta_r_nn
     max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
     min_red = torch.tensor(-2.0, device=delta_r_nn.device)
     r_real_nn = torch.minimum(torch.maximum(r_total_nn, min_red), max_red)
     r_real_nn[:, 0] = 0.0  # Move 1 is searched at full depth (r = 0.00)
 
-    # 4. Direct Physical Search Effort: Move 0 is searched at full depth (effort = 1.0), Moves 1..M-1 are late moves
+    # 3. Direct Physical Search Effort
     masked_r = r_real_nn.masked_fill(~legal_mask, 1e4)
     E_late = torch.exp(-masked_r / tau_lmr) * legal_mask.float()
     E_eff = E_late.clone()
@@ -557,9 +539,8 @@ def compute_combined_losses(
     Q_dist = E_eff / (D + 1e-12)
     loss_lmr_order = (w_depth * -(target_p_lmr * torch.log(Q_dist + 1e-12)).sum(dim=-1)).mean()
 
-    # 5. Direct Physical Rank Profile MSE (Anchored to Master's baseline reduction profile)
+    # 4. Direct Physical Rank Profile MSE
     loss_rank_profile = (w_depth.unsqueeze(1) * (delta_r_nn ** 2) * legal_mask.float()).sum() / legal_mask.sum().clamp(min=1.0)
-
     loss_lmr_total = lmr_ord_coef * loss_lmr_order + rank_profile_coef * loss_rank_profile
 
     if train_mode == "movepicker":
@@ -569,9 +550,7 @@ def compute_combined_losses(
     else:
         loss_total = loss_mp_total + loss_lmr_total
 
-    mean_q_star = Q_dist.gather(1, i_star.unsqueeze(1)).squeeze(1).mean()
-
-    return loss_total, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_order, loss_rank_profile, acc_q, acc_c, mean_q_star
+    return loss_total, loss_mp_kl_q, loss_w_anchor, loss_lmr_order, loss_rank_profile, acc_q
 
 
 def compute_standardized_rollout_metrics(
@@ -579,7 +558,6 @@ def compute_standardized_rollout_metrics(
     target_p_lmr: torch.Tensor,
     r_real: torch.Tensor,
     z_q: torch.Tensor,
-    z_c: torch.Tensor,
     is_cap: torch.Tensor,
     legal_mask: torch.Tensor,
     tau_mp: torch.Tensor,
@@ -591,24 +569,16 @@ def compute_standardized_rollout_metrics(
     B, M = target_p_mp.shape
     i_star = target_p_mp.argmax(dim=-1)
 
-    # 1. MovePicker Sub-Distributions (Filtered >= 5% mass)
+    # 1. Quiet MovePicker Sub-Distribution (Filtered >= 25% mass)
     quiet_mask = legal_mask & (~is_cap)
     masked_zq = z_q.masked_fill(~quiet_mask, -1e4)
     log_probs_q = F.log_softmax(masked_zq / tau_mp, dim=-1)
-    p_q = target_p_mp * quiet_mask.float()
-    w_q_pos = p_q.sum(dim=-1)
-    has_quiets = (w_q_pos >= 0.05) & (quiet_mask.sum(dim=-1) > 1)
-    mp_kl_q = -(p_q[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1).mean() if has_quiets.sum() > 0 else torch.tensor(0.0)
-    acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q[has_quiets].argmax(dim=-1)).float().mean() if has_quiets.sum() > 0 else torch.tensor(0.0)
+    p_q_raw = target_p_mp * quiet_mask.float()
+    w_q_pos = p_q_raw.sum(dim=-1)
+    has_quiets = (w_q_pos >= 0.25) & (quiet_mask.sum(dim=-1) > 1)
 
-    cap_mask = legal_mask & is_cap
-    masked_zc = z_c.masked_fill(~cap_mask, -1e4)
-    log_probs_c = F.log_softmax(masked_zc / tau_mp, dim=-1)
-    p_c = target_p_mp * cap_mask.float()
-    w_c_pos = p_c.sum(dim=-1)
-    has_caps = (w_c_pos >= 0.05) & (cap_mask.sum(dim=-1) > 1)
-    mp_kl_c = -(p_c[has_caps] * log_probs_c[has_caps]).sum(dim=-1).mean() if has_caps.sum() > 0 else torch.tensor(0.0)
-    acc_c = (masked_zc[has_caps].argmax(dim=-1) == p_c[has_caps].argmax(dim=-1)).float().mean() if has_caps.sum() > 0 else torch.tensor(0.0)
+    mp_kl_q = -(p_q_raw[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1).mean() if has_quiets.sum() > 0 else torch.tensor(0.0)
+    acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q_raw[has_quiets].argmax(dim=-1)).float().mean() if has_quiets.sum() > 0 else torch.tensor(0.0)
 
     # 2. Search Effort & Allocation
     r_real_clean = r_real.clone()
@@ -642,12 +612,10 @@ def compute_standardized_rollout_metrics(
     return {
         "top1_match": top1_match.item() * 100.0,
         "quiet_top1": acc_q.item() * 100.0,
-        "cap_top1": acc_c.item() * 100.0,
         "cpp1_in_m3_match": m1_in_top3.item() * 100.0,
         "m1_in_cpp3_match": top1_in_m3.item() * 100.0,
         "mp_kl_q": mp_kl_q.item(),
-        "mp_kl_c": mp_kl_c.item(),
-        "mp_kl_loss": (mp_kl_q + mp_kl_c).item(),
+        "mp_kl_loss": mp_kl_q.item(),
         "q_search_star": q_star.item() * 100.0,
         "lmr_policy_loss": lmr_policy_loss.item(),
         "top1_reduction": top1_red.item(),
@@ -663,11 +631,9 @@ def print_unified_benchmark_report(title: str, stats: Dict[str, float]):
     print("=" * 80, flush=True)
     print(f"{'Physical Move 1 == Monty Top-1 Match:':<45} {stats.get('top1_match', 0.0):.2f}%", flush=True)
     print(f"{'  - Physical Quiet 1 Match (within Q):':<45} {stats.get('quiet_top1', 0.0):.2f}%", flush=True)
-    print(f"{'  - Physical Capture 1 Match (within C):':<45} {stats.get('cap_top1', 0.0):.2f}%", flush=True)
     print(f"{'Physical Move 1 in Monty Top-3 Match:':<45} {stats.get('cpp1_in_m3_match', 0.0):.2f}%", flush=True)
     print(f"{'Monty Top-1 in Physical Move 1..3 Match:':<45} {stats.get('m1_in_cpp3_match', 0.0):.2f}% (Dual)", flush=True)
     print(f"{'MovePicker Quiet KL Divergence:':<45} {stats.get('mp_kl_q', 0.0):.4f}", flush=True)
-    print(f"{'MovePicker Capture KL Divergence:':<45} {stats.get('mp_kl_c', 0.0):.4f}", flush=True)
     print(f"{'Mean Top Move Search Allocation Q(i*):':<45} {stats.get('q_search_star', 0.0):.2f}%", flush=True)
     print(f"{'LMR Policy Cross-Entropy Loss:':<45} {stats.get('lmr_policy_loss', 0.0):.4f}", flush=True)
     print(f"{'Mean LMR Reduction on Monty Top-1 Move:':<45} {stats.get('top1_reduction', 0.0):.2f} plies", flush=True)
@@ -686,7 +652,7 @@ def evaluate_handcrafted_master(
     total_count = 0
 
     with torch.no_grad():
-        for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in loader:
+        for u_node, t_quiet, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in loader:
             B, M = z_legacy_mp.shape
             max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
             min_red = torch.tensor(-2.0, device=r_legacy.device)
@@ -694,13 +660,13 @@ def evaluate_handcrafted_master(
 
             tau_mp_t = torch.tensor(tau_mp, device=z_legacy_mp.device)
             tau_lmr_t = torch.tensor(tau_lmr, device=z_legacy_mp.device)
+            z_master_q = t_quiet.sum(dim=-1) / 32768.0
 
             b_stats = compute_standardized_rollout_metrics(
                 target_p_mp=target_p_mp,
                 target_p_lmr=target_p_lmr,
                 r_real=r_real_leg,
-                z_q=z_legacy_mp,
-                z_c=z_legacy_mp,
+                z_q=z_master_q,
                 is_cap=is_cap,
                 legal_mask=legal_mask,
                 tau_mp=tau_mp_t,
@@ -718,27 +684,26 @@ def evaluate_handcrafted_master(
 def evaluate_validation_rollout(
     model: DualMiniNN,
     loader: DataLoader,
-    mp_anchor_coef: float = 0.20,
+    mp_anchor_coef: float = 0.05,
     lmr_ord_coef: float = 0.40,
     rank_profile_coef: float = 0.40,
     tau_lmr: float = 1.5,
     train_mode: str = "both"
 ) -> Dict[str, float]:
     model.eval()
-    tot_loss_sum, mp_anc_sum, rank_prof_loss_sum = 0.0, 0.0, 0.0
+    tot_loss_sum, w_anc_sum, rank_prof_loss_sum = 0.0, 0.0, 0.0
     stat_sums = {}
     total_count = 0
 
     with torch.no_grad():
-        for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in loader:
-            w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, cap_scores, delta_r_nn = model(u_node, x_quiet, x_cap, x_lmr)
+        for u_node, t_quiet, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in loader:
+            w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, delta_r_nn = model(u_node, t_quiet, x_lmr)
 
             z_quiet = quiet_scores / 32768.0
-            z_cap = cap_scores / 32768.0
 
-            loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, acc_q, acc_c, mean_q_star = compute_combined_losses(
-                z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
-                mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, train_mode=train_mode
+            loss, loss_mp_kl_q, loss_w_anc, loss_lmr_ord, loss_rank_prof, acc_q = compute_combined_losses(
+                z_quiet, delta_r_nn, tau_mp, tau_lmr, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
+                w_quiet=w_quiet, mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, train_mode=train_mode
             )
 
             r_total_nn = r_base + delta_r_nn
@@ -751,7 +716,6 @@ def evaluate_validation_rollout(
                 target_p_lmr=target_p_lmr,
                 r_real=r_real_nn,
                 z_q=z_quiet,
-                z_c=z_cap,
                 is_cap=is_cap,
                 legal_mask=legal_mask,
                 tau_mp=tau_mp,
@@ -761,7 +725,7 @@ def evaluate_validation_rollout(
             B = u_node.size(0)
             total_count += B
             tot_loss_sum += loss.item() * B
-            mp_anc_sum += loss_mp_shape.item() * B
+            w_anc_sum += loss_w_anc.item() * B
             rank_prof_loss_sum += loss_rank_prof.item() * B
 
             for k, v in b_stats.items():
@@ -771,7 +735,7 @@ def evaluate_validation_rollout(
     n = max(1, total_count)
     res = {k: v / n for k, v in stat_sums.items()}
     res["total_loss"] = tot_loss_sum / n
-    res["mp_anchor_loss"] = mp_anc_sum / n
+    res["w_anchor_loss"] = w_anc_sum / n
     res["rank_profile_loss"] = rank_prof_loss_sum / n
     return res
 
@@ -781,12 +745,6 @@ def evaluate_2d_depth_rank_matrix(
     loader: DataLoader,
     tau_lmr: float = 1.5
 ):
-    """
-    Computes a comprehensive 2D Matrix of late-move reductions and search efforts:
-    - 3 Depth Bands: Low (d: 2-6), Mid (d: 7-12), Deep (d: 13+)
-    - 4 Late-Move Buckets: Move 2, Move 3, Move 4, Moves 5+ (Tail)
-    Uses direct physical move rank column indexing.
-    """
     model.eval()
     bands = [
         ("Low (d: 2-6)", 2, 6),
@@ -803,8 +761,8 @@ def evaluate_2d_depth_rank_matrix(
     }
 
     with torch.no_grad():
-        for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in loader:
-            w_quiet, z_latents, tau_mp, t_lmr_pred, quiet_scores, cap_scores, delta_r_nn = model(u_node, x_quiet, x_cap, x_lmr)
+        for u_node, t_quiet, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in loader:
+            w_quiet, z_latents, tau_mp, t_lmr_pred, quiet_scores, delta_r_nn = model(u_node, t_quiet, x_lmr)
 
             r_total_nn = r_base + delta_r_nn
             max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
@@ -834,7 +792,6 @@ def evaluate_2d_depth_rank_matrix(
 
                 b_stats = stats[band_name]
 
-                # Moves 2, 3, 4 (Physical Move Ranks: column indices k = 1, 2, 3)
                 for k in range(1, 4):
                     if num_m > k:
                         b_stats["nn_red"][k-1] += r_real_nn[b, k].item()
@@ -843,7 +800,6 @@ def evaluate_2d_depth_rank_matrix(
                         b_stats["leg_eff"][k-1] += E_leg[b, k].item()
                         b_stats["counts"][k-1] += 1
 
-                # Move 5+ (Tail Bucket: column indices k >= 4)
                 if num_m > 4:
                     b_stats["nn_red"][3] += r_real_nn[b, 4:num_m].mean().item()
                     b_stats["nn_eff"][3] += E_nn[b, 4:num_m].mean().item()
@@ -1001,7 +957,7 @@ def collect_or_load_offpolicy_buffer(
     nodes_per_fen: int,
     sample_interval: int,
     workers: int,
-    session_tag: str = "master_offpolicy_shared_v3"
+    session_tag: str = "master_offpolicy_shared_v4"
 ) -> Tuple[str, str]:
     """
     Collects or reuses a large Master off-policy replay buffer:
@@ -1164,8 +1120,8 @@ def run_heldout_online_evaluation(
         model.export_quantized_binary(temp_model_path)
 
     if model is None:
-        tel_path = os.path.join(CACHE_DIR, "master_heldout_shared_v3.jsonl")
-        db_path = os.path.join(CACHE_DIR, "master_heldout_shared_v3.db")
+        tel_path = os.path.join(CACHE_DIR, "master_heldout_shared_v4.jsonl")
+        db_path = os.path.join(CACHE_DIR, "master_heldout_shared_v4.db")
     else:
         tel_path = os.path.join(CACHE_DIR, f"heldout_tel_{session_tag}.jsonl")
         db_path = os.path.join(CACHE_DIR, f"heldout_monty_{session_tag}.db")
@@ -1436,19 +1392,18 @@ def train_single_run(
             train_loader = DataLoader(train_dataset, batch_size=args.minibatch_size, shuffle=True)
 
         iter_steps = 0
-        iter_loss, iter_mp_kl_q, iter_mp_kl_c, iter_lmr_ord = 0.0, 0.0, 0.0, 0.0
+        iter_loss, iter_mp_kl_q, iter_w_anc, iter_lmr_ord = 0.0, 0.0, 0.0, 0.0
 
         for epoch in range(args.ppo_epochs):
-            for u_node, x_quiet, x_cap, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in train_loader:
+            for u_node, t_quiet, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in train_loader:
                 optimizer.zero_grad()
-                w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, cap_scores, delta_r_nn = model(u_node, x_quiet, x_cap, x_lmr)
+                w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, delta_r_nn = model(u_node, t_quiet, x_lmr)
 
                 z_quiet = quiet_scores / 32768.0
-                z_cap = cap_scores / 32768.0
 
-                loss, loss_mp_kl_q, loss_mp_kl_c, loss_mp_shape, loss_lmr_ord, loss_rank_prof, _, _, _ = compute_combined_losses(
-                    z_quiet, z_cap, delta_r_nn, tau_mp, tau_lmr, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
-                    mp_shape_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, train_mode=train_mode
+                loss, loss_mp_kl_q, loss_w_anchor, loss_lmr_ord, loss_rank_prof, _ = compute_combined_losses(
+                    z_quiet, delta_r_nn, tau_mp, tau_lmr, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
+                    w_quiet=w_quiet, mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, train_mode=train_mode
                 )
 
                 loss.backward()
@@ -1460,7 +1415,7 @@ def train_single_run(
                 iter_steps += 1
                 iter_loss += loss.item()
                 iter_mp_kl_q += loss_mp_kl_q.item()
-                iter_mp_kl_c += loss_mp_kl_c.item()
+                iter_w_anc += loss_w_anchor.item()
                 iter_lmr_ord += loss_lmr_ord.item()
 
                 if total_gradient_steps % args.sync_interval == 0:
@@ -1470,7 +1425,7 @@ def train_single_run(
         curr_lr = scheduler.get_last_lr()[0]
         n_steps = max(1, iter_steps)
 
-        live_str = f"Live Search: Top1:{live_stats['top1_match']:4.1f}% (Q:{live_stats['quiet_top1']:4.1f}%, C:{live_stats['cap_top1']:4.1f}%)"
+        live_str = f"Live Search: Top1:{live_stats['top1_match']:4.1f}% (Q:{live_stats['quiet_top1']:4.1f}%)"
         if train_mode != "movepicker":
             live_str += f", RedTop1:{live_stats['top1_reduction']:4.2f}p, RedLate:{live_stats['late_reduction']:4.2f}p"
 
@@ -1481,11 +1436,11 @@ def train_single_run(
                 tau_lmr=tau_student_lmr, train_mode=train_mode
             )
             print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag} | {mode_str})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
-                  f"Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR: {iter_lmr_ord/n_steps:.3f}) | "
-                  f"{live_str} | Val MP: (Q:{val_stats['quiet_top1']:4.1f}%, C:{val_stats['cap_top1']:4.1f}%) | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
+                  f"Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, W_Anc: {iter_w_anc/n_steps:.3f}, LMR: {iter_lmr_ord/n_steps:.3f}) | "
+                  f"{live_str} | Val MP: (Q:{val_stats['quiet_top1']:4.1f}%) | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
         else:
             print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag} | {mode_str})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
-                  f"Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, MP_C: {iter_mp_kl_c/n_steps:.3f}, LMR: {iter_lmr_ord/n_steps:.3f}) | {live_str}", flush=True)
+                  f"Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, W_Anc: {iter_w_anc/n_steps:.3f}, LMR: {iter_lmr_ord/n_steps:.3f}) | {live_str}", flush=True)
 
     # Clean up any remaining sliding window temp files
     for _, old_tel, old_db in onpolicy_datasets_window:
@@ -1508,7 +1463,7 @@ def train_single_run(
     evaluate_2d_depth_rank_matrix(model, val_loader, tau_lmr=tau_student_lmr)
 
     # Final Online Testing Step on Heldout FENs (Matching val_samples scale)
-    if test_fens_pool:
+    if test_fens_pool and not getattr(args, "skip_heldout_eval", False):
         heldout_stats = run_heldout_online_evaluation(
             model=model,
             test_fens=test_fens_pool,
@@ -1542,6 +1497,7 @@ def main():
     parser.add_argument("--train-fens-pool", type=int, default=100000, help="Training FEN pool (default: 100,000)")
     parser.add_argument("--val-fens-pool", type=int, default=1000, help="Validation FEN pool (default: 1,000)")
     parser.add_argument("--test-fens-pool", type=int, default=1000, help="Held-out Test FEN pool (default: 1,000)")
+    parser.add_argument("--skip-heldout-eval", action="store_true", help="Skip held-out online evaluation at the end of the run")
     parser.add_argument("--nodes", type=int, default=500_000, help="Search budget per FEN (default: 500,000)")
     parser.add_argument("--sample-interval", type=int, default=10_000, help="Subsample interval (default: 10,000)")
     parser.add_argument("--workers", type=int, default=6, help="Parallel worker threads (default: 6)")
@@ -1607,7 +1563,7 @@ def main():
         target_samples=args.val_samples,
         nodes_per_fen=args.nodes,
         workers=args.workers,
-        session_tag="val_v3_staged_500k_shared"
+        session_tag="val_v4_staged_500k_shared"
     )
 
     val_dataset = RolloutDataset(
@@ -1642,7 +1598,7 @@ def main():
             nodes_per_fen=args.nodes,
             sample_interval=args.sample_interval,
             workers=args.workers,
-            session_tag="master_offpolicy_shared_v3"
+            session_tag="master_offpolicy_shared_v4"
         )
         offpolicy_dataset = RolloutDataset(
             telemetry_path=offpolicy_tel,
@@ -1747,13 +1703,13 @@ def main():
         print("\n" + "=" * 100, flush=True)
         print("      FINAL BENCHMARK EVALUATION (ON FIXED 2^15 VALIDATION ROLLOUT)", flush=True)
         print("=" * 100, flush=True)
-        print(f"{'Metric':<40} | {'Trained Dual Mini-NN (V3)':<25} | {'Handcrafted Master Baseline':<25}", flush=True)
+        print(f"{'Metric':<40} | {'Trained Dual Mini-NN (V4)':<25} | {'Handcrafted Master Baseline':<25}", flush=True)
         print("-" * 100, flush=True)
         print(f"{'Physical Move 1 == Monty Top-1':<40} | {final_stats['top1_match']:<24.2f}% | {master_stats['top1_match']:<24.2f}%", flush=True)
         print(f"{'Quiet Moves Top-1 Match (within Q)':<40} | {final_stats['quiet_top1']:<24.2f}% | {master_stats['quiet_top1']:<24.2f}%", flush=True)
-        print(f"{'Capture Moves Top-1 Match (within C)':<40} | {final_stats['cap_top1']:<24.2f}% | {master_stats['cap_top1']:<24.2f}%", flush=True)
+        print(f"{'Physical Move 1 in Monty Top-3':<40} | {final_stats['cpp1_in_m3_match']:<24.2f}% | {master_stats['cpp1_in_m3_match']:<24.2f}%", flush=True)
+        print(f"{'Monty Top-1 in Physical Move 1..3':<40} | {final_stats['m1_in_cpp3_match']:<24.2f}% | {master_stats['m1_in_cpp3_match']:<24.2f}%", flush=True)
         print(f"{'MovePicker Quiet KL Divergence':<40} | {final_stats['mp_kl_q']:<25.4f} | {master_stats['mp_kl_q']:<25.4f}", flush=True)
-        print(f"{'MovePicker Capture KL Divergence':<40} | {final_stats['mp_kl_c']:<25.4f} | {master_stats['mp_kl_c']:<25.4f}", flush=True)
         print(f"{'Mean Top Move Search Allocation Q(i*)':<40} | {final_stats['q_search_star']:<24.2f}% | {master_stats['q_search_star']:<24.2f}%", flush=True)
         print(f"{'LMR Policy Cross-Entropy Loss':<40} | {final_stats['lmr_policy_loss']:<25.4f} | {master_stats['lmr_policy_loss']:<25.4f}", flush=True)
         print(f"{'Mean LMR Reduction on Monty Top-1':<40} | {final_stats['top1_reduction']:<24.2f} plies | {master_stats['top1_reduction']:<24.2f} plies", flush=True)

@@ -1,6 +1,6 @@
 """
-Dataset & Feature Extractor for Version 3 Dual Mini-NN (MovePicker & LMR).
-Standardizes node and move features into [-1.0, 1.0] matching C++ SIMD inference in mininn.cpp.
+Dataset & Feature Extractor for Version 4 Dual Mini-NN (MovePicker & LMR).
+Extracts 10 handcrafted terms for quiet moves and 8 raw signals for LMR.
 """
 
 import math
@@ -72,36 +72,23 @@ def extract_node_features_from_data(s: dict) -> Optional[torch.Tensor]:
     return None
 
 
-def extract_quiet_features_from_data(m_data: dict, ply: int = 16) -> torch.Tensor:
-    if "x_quiet" in m_data:
-        return torch.from_numpy(np.array(m_data["x_quiet"], dtype=np.float32) / 64.0)
-    x = np.zeros(12, dtype=np.float32)
-    x[0] = np.clip(m_data.get("main_hist", 0) / 16384.0, -1.0, 1.0)
-    x[1] = np.clip(m_data.get("pawn_hist", 0) / 16384.0, -1.0, 1.0)
-    ch = m_data.get("cont_hist", [0, 0, 0, 0, 0])
-    for idx, c_val in enumerate(ch[:5]):
-        x[2 + idx] = np.clip(c_val / 16384.0, -1.0, 1.0)
-    x[7] = 1.0 if m_data.get("gives_check", False) else -1.0
-    x[8] = 1.0 if m_data.get("threat_from", False) else -1.0
-    x[9] = 1.0 if m_data.get("threat_to", False) else -1.0
-    moved_pt = m_data.get("moved_pt", 1)
-    x[10] = np.clip((moved_pt - 2.0) / 2.0, -1.0, 1.0)
-    low_ply = m_data.get("low_ply_hist", 0)
-    x[11] = np.clip((low_ply / (1 + ply)) / 16384.0, -1.0, 1.0)
-    return torch.from_numpy(x)
-
-
-def extract_capture_features_from_data(m_data: dict) -> torch.Tensor:
-    if "x_cap" in m_data:
-        return torch.from_numpy(np.array(m_data["x_cap"], dtype=np.float32) / 64.0)
-    x = np.zeros(4, dtype=np.float32)
-    x[0] = np.clip(m_data.get("capt_hist", 0) / 16384.0, -1.0, 1.0)
-    cap_val = PIECE_VALS.get(m_data.get("captured_pt", 0), 100)
-    moved_val = PIECE_VALS.get(m_data.get("moved_pt", 1), 100)
-    x[1] = np.clip(cap_val / 500.0, 0.0, 1.0)
-    x[2] = np.clip((cap_val - moved_val) / 500.0, -1.0, 1.0)
-    x[3] = 1.0 if m_data.get("gives_check", False) else -1.0
-    return torch.from_numpy(x)
+def extract_quiet_terms_from_data(m_data: dict, ply: int = 16) -> torch.Tensor:
+    t = np.zeros(10, dtype=np.float32)
+    if "x_quiet" in m_data and len(m_data["x_quiet"]) >= 10:
+        xq = np.array(m_data["x_quiet"][:10], dtype=np.float32)
+        t[0] = xq[0] * 512.0                  # 2 * mainHistory
+        t[1] = xq[1] * 512.0                  # 2 * pawnHistory
+        t[2] = xq[2] * 256.0                  # contHistory[0]
+        t[3] = xq[3] * 256.0                  # contHistory[1]
+        t[4] = xq[4] * 256.0                  # contHistory[2]
+        t[5] = xq[5] * 256.0                  # contHistory[3]
+        t[6] = xq[6] * 256.0                  # contHistory[5]
+        t[7] = 16384.0 if xq[7] > 0 else 0.0  # check bonus
+        t[8] = xq[8] * (18000.0 / 64.0)       # threat bonus/penalty
+        t[9] = xq[9] * 256.0                  # lowPlyHistory
+    elif "stat_score" in m_data:
+        t[0] = float(m_data.get("stat_score", 0))
+    return torch.from_numpy(t)
 
 
 def extract_lmr_features_from_data(m_data: dict, tt_pv: bool = False) -> torch.Tensor:
@@ -118,102 +105,6 @@ def extract_lmr_features_from_data(m_data: dict, tt_pv: bool = False) -> torch.T
     x[4] = 1.0 if m_data.get("gives_check", False) else -1.0
     x[5] = 1.0 if m_data.get("is_promotion", False) else -1.0
     moved_pt = m_data.get("moved_pt", 1)
-    x[6] = np.clip((moved_pt - 2.0) / 2.0, -1.0, 1.0)
-    x[7] = 1.0 if tt_pv else -1.0
-    return torch.from_numpy(x)
-
-
-def extract_quiet_features(
-    board: chess.Board,
-    move: chess.Move,
-    stat_score: int = 0,
-    ply: int = 16
-) -> torch.Tensor:
-    """
-    Extracts 12 raw signals for score_quiet in [-1.0, 1.0].
-    """
-    x = np.zeros(12, dtype=np.float32)
-    x[0] = np.clip(stat_score / 16384.0, -1.0, 1.0)
-    x[1] = 0.0
-    x[2] = 0.0
-    x[3] = 0.0
-    x[4] = 0.0
-    x[5] = 0.0
-    x[6] = 0.0
-
-    board.push(move)
-    gives_check = board.is_check()
-    board.pop()
-    x[7] = 1.0 if gives_check else -1.0
-    x[8] = 0.0
-    x[9] = 0.0
-
-    moved_pt = board.piece_type_at(move.from_square) or 1
-    x[10] = np.clip((moved_pt - 2.0) / 2.0, -1.0, 1.0)
-    x[11] = np.clip(stat_score / (1 + ply) / 16384.0, -1.0, 1.0)
-    return torch.from_numpy(x)
-
-
-def extract_capture_raw_features(
-    board: chess.Board,
-    move: chess.Move,
-    stat_score: int = 0
-) -> torch.Tensor:
-    """
-    Extracts 4 raw tactical signals for score_capture in [-1.0, 1.0].
-    """
-    x = np.zeros(4, dtype=np.float32)
-    x[0] = np.clip(stat_score / 16384.0, -1.0, 1.0)
-
-    piece_vals = {chess.PAWN: 100, chess.KNIGHT: 300, chess.BISHOP: 300, chess.ROOK: 500, chess.QUEEN: 900}
-    captured_pt = board.piece_type_at(move.to_square)
-    moved_pt = board.piece_type_at(move.from_square)
-
-    cap_val = piece_vals.get(captured_pt, 100) if captured_pt else 100
-    moved_val = piece_vals.get(moved_pt, 100) if moved_pt else 100
-
-    x[1] = np.clip(cap_val / 500.0, 0.0, 1.0)
-    x[2] = np.clip((cap_val - moved_val) / 500.0, -1.0, 1.0)
-
-    board.push(move)
-    gives_check = board.is_check()
-    board.pop()
-    x[3] = 1.0 if gives_check else -1.0
-    return torch.from_numpy(x)
-
-
-def extract_lmr_raw_features(
-    board: chess.Board,
-    move: chess.Move,
-    stat_score: int = 0,
-    rank: int = 0,
-    tt_pv: bool = False
-) -> torch.Tensor:
-    """
-    Extracts 8 raw move features for evaluate_lmr in [-1.0, 1.0].
-    """
-    x = np.zeros(8, dtype=np.float32)
-    x[0] = np.clip(stat_score / 2000.0, -1.0, 1.0)
-    x[1] = np.clip((rank - 4.0) / 8.0, -1.0, 1.0)
-
-    is_capture = board.is_capture(move)
-    x[2] = 1.0 if is_capture else -1.0
-
-    piece_vals = {chess.PAWN: 100, chess.KNIGHT: 300, chess.BISHOP: 300, chess.ROOK: 500, chess.QUEEN: 900}
-    if is_capture:
-        captured_pt = board.piece_type_at(move.to_square)
-        cap_val = piece_vals.get(captured_pt, 100) if captured_pt else 100
-        x[3] = np.clip(cap_val / 500.0, 0.0, 1.0)
-    else:
-        x[3] = 0.0
-
-    board.push(move)
-    gives_check = board.is_check()
-    board.pop()
-    x[4] = 1.0 if gives_check else -1.0
-    x[5] = 1.0 if move.promotion else -1.0
-
-    moved_pt = board.piece_type_at(move.from_square) or 1
     x[6] = np.clip((moved_pt - 2.0) / 2.0, -1.0, 1.0)
     x[7] = 1.0 if tt_pv else -1.0
     return torch.from_numpy(x)

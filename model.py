@@ -1,14 +1,13 @@
 """
-Mini-NN Engine Architecture (Version 3 with Full Activation QAT):
-1. NodeNetwork: 16 -> 32 -> 32 -> 26
-   - 16 dynamic meta-weights for quiet moves (w_quiet)
-   - 8 position latents for captures & LMR (z_latents)
-   - 1 dynamic temperature for MovePicker (tau_mp, base 0.6830)
-   - 1 dynamic temperature for LMR (tau_lmr, base 0.1232)
-2. QuietMoveNetwork: 12 -> 16 -> 1 (combined via dynamic inner product with w_quiet)
-3. CaptureMoveNetwork: (4 raw + 8 latents) = 12 -> 16 -> 1
-4. LMRMoveNetwork: (8 raw + 8 latents) = 16 -> 16 -> 1
-5. Symmetric Quantization with Straight-Through Estimator (STE) across weights, biases, and activations.
+Mini-NN Engine Architecture (Version 4: Dynamic Handcrafted Quiet Terms Weighting + LMR):
+1. NodeNetwork: 16 -> 32 -> 32 -> 20
+   - 10 dynamic weighting multipliers for handcrafted quiet terms (w_quiet, Scale 256: 256 = 1.0x)
+   - 8 position latents for LMR (z_latents, Scale 64)
+   - 1 dynamic temperature for MovePicker (tau_mp)
+   - 1 dynamic temperature for LMR (tau_lmr)
+2. Quiet Move Scoring: Direct linear combination of 10 handcrafted terms (T_0..T_9) with w_quiet.
+3. LMRMoveNetwork: (8 raw + 8 latents) = 16 -> 16 -> 1
+4. Symmetric Quantization with Straight-Through Estimator (STE).
 """
 
 import json
@@ -68,7 +67,7 @@ class QuantizedClippedReLU(nn.Module):
 
 
 class NodeNetwork(nn.Module):
-    def __init__(self, in_dim=16, hidden_dim=32, out_dim=26, scale=64.0, tau_mp_base=None, tau_lmr_base=None):
+    def __init__(self, in_dim=16, hidden_dim=32, out_dim=20, scale=64.0, tau_mp_base=None, tau_lmr_base=None):
         super().__init__()
         self.scale = scale
         if tau_mp_base is None or tau_lmr_base is None:
@@ -86,6 +85,12 @@ class NodeNetwork(nn.Module):
         self.act0 = QuantizedClippedReLU(scale)
         self.act1 = QuantizedClippedReLU(scale)
 
+        # Initialize quiet term weights to 1.0 (Master default)
+        with torch.no_grad():
+            self.fc2.bias.data.zero_()
+            self.fc2.bias.data[0:10] = 1.0
+            self.fc2.weight.data.normal_(0.0, 0.01)
+
     def forward(self, u):
         u_q = quantize_ste(u, self.scale)
         w0 = quantize_ste(self.fc0.weight, self.scale)
@@ -100,71 +105,23 @@ class NodeNetwork(nn.Module):
         b2 = quantize_bias_ste(self.fc2.bias, self.scale * self.scale)
         out = F.linear(h1, w2, b2)
 
-        # 0..15: 16 dynamic meta-weights for quiet moves (scale 127, range [-1.0, 1.0])
-        w_quiet = quantize_ste(torch.clamp(out[:, 0:16], -1.0, 1.0), 127.0)
+        # 0..9: 10 dynamic multipliers for handcrafted quiet terms (scale 256, range [-4.0, 4.0])
+        w_quiet_raw = torch.clamp(out[:, 0:10], -4.0, 4.0)
+        w_quiet_q = torch.clamp(torch.round(w_quiet_raw * 256.0), -1024.0, 1024.0) / 256.0
+        w_quiet = w_quiet_raw + (w_quiet_q - w_quiet_raw).detach()
 
-        # 16..23: 8 position latents for captures & LMR (scale 64, range [-127/64, 127/64])
-        z_latents = quantize_ste(torch.clamp(out[:, 16:24], -127.0 / 64.0, 127.0 / 64.0), 64.0)
+        # 10..17: 8 position latents for LMR (scale 64, range [-127/64, 127/64])
+        z_latents = quantize_ste(torch.clamp(out[:, 10:18], -127.0 / 64.0, 127.0 / 64.0), 64.0)
 
-        # 24: log_tau_mp (loaded dynamically from calib_config.json)
-        log_tau_mp = out[:, 24:25]
+        # 18: log_tau_mp
+        log_tau_mp = out[:, 18:19]
         tau_mp = self.tau_mp_base * torch.exp(torch.clamp(log_tau_mp, -1.5, 1.5))
 
-        # 25: log_tau_lmr (loaded dynamically from calib_config.json)
-        log_tau_lmr = out[:, 25:26]
+        # 19: log_tau_lmr
+        log_tau_lmr = out[:, 19:20]
         tau_lmr = self.tau_lmr_base * torch.exp(torch.clamp(log_tau_lmr, -1.5, 1.5))
 
         return w_quiet, z_latents, tau_mp, tau_lmr
-
-
-class QuietMoveNetwork(nn.Module):
-    def __init__(self, in_dim=12, hidden_dim=16, scale=64.0):
-        super().__init__()
-        self.scale = scale
-        self.fc0 = nn.Linear(in_dim, hidden_dim)
-        self.act0 = QuantizedClippedReLU(scale)
-
-    def forward(self, x_quiet, w_quiet):
-        xq_q = quantize_ste(x_quiet, self.scale)
-        w0 = quantize_ste(self.fc0.weight, self.scale)
-        b0 = quantize_bias_ste(self.fc0.bias, self.scale * self.scale)
-        h = self.act0(F.linear(xq_q, w0, b0))
-
-        # Dynamic inner product with w_quiet
-        w_exp = w_quiet.unsqueeze(1)
-        z_raw = torch.clamp((h * w_exp).sum(dim=-1), -1.0, 1.0)
-        score_float = z_raw * 32768.0
-        score_int = torch.clamp(torch.floor((z_raw * 8128.0 * 512.0 + 63.0) / 127.0), -32768.0, 32767.0)
-        quiet_scores = score_float + (score_int - score_float).detach()
-        z_quiet = quiet_scores / 32768.0
-        return z_quiet, quiet_scores
-
-
-class CaptureMoveNetwork(nn.Module):
-    def __init__(self, in_dim=12, hidden_dim=16, scale=64.0):
-        super().__init__()
-        self.scale = scale
-        self.fc0 = nn.Linear(in_dim, hidden_dim)
-        self.fc1 = nn.Linear(hidden_dim, 1)
-        self.act0 = QuantizedClippedReLU(scale)
-
-    def forward(self, x_raw_cap, z_latents):
-        B, N, _ = x_raw_cap.shape
-        z_exp = z_latents.unsqueeze(1).expand(B, N, -1)
-        x_cap = torch.cat([quantize_ste(x_raw_cap, self.scale), z_exp], dim=-1)
-
-        w0 = quantize_ste(self.fc0.weight, self.scale)
-        b0 = quantize_bias_ste(self.fc0.bias, self.scale * self.scale)
-        h0 = self.act0(F.linear(x_cap, w0, b0))
-
-        w1 = quantize_ste(self.fc1.weight, self.scale)
-        b1 = quantize_bias_ste(self.fc1.bias, self.scale * self.scale)
-        score_raw = F.linear(h0, w1, b1).squeeze(-1)
-        score_float = torch.clamp(score_raw, -1.0, 1.0) * 32768.0
-        score_int = torch.clamp(torch.round(score_raw * 4096.0) * 8.0, -32768.0, 32767.0)
-        cap_scores = score_float + (score_int - score_float).detach()
-        z_cap = cap_scores / 32768.0
-        return z_cap, cap_scores
 
 
 class LMRMoveNetwork(nn.Module):
@@ -194,22 +151,29 @@ class LMRMoveNetwork(nn.Module):
 
 class DualMiniNN(nn.Module):
     MAGIC = 0x4D494E49  # 'MINI'
-    VERSION = 3         # Version 3: Full Architecture (score_quiet, score_capture, evaluate_lmr)
+    VERSION = 4         # Version 4: Dynamic Quiet Terms (Scale 256) + LMR
     WEIGHT_SCALE = 64
 
     def __init__(self, tau_mp_base=None, tau_lmr_base=None):
         super().__init__()
-        self.node_net = NodeNetwork(in_dim=16, hidden_dim=32, out_dim=26, scale=self.WEIGHT_SCALE, tau_mp_base=tau_mp_base, tau_lmr_base=tau_lmr_base)
-        self.quiet_net = QuietMoveNetwork(in_dim=12, hidden_dim=16, scale=self.WEIGHT_SCALE)
-        self.cap_net = CaptureMoveNetwork(in_dim=12, hidden_dim=16, scale=self.WEIGHT_SCALE)
+        self.node_net = NodeNetwork(in_dim=16, hidden_dim=32, out_dim=20, scale=self.WEIGHT_SCALE, tau_mp_base=tau_mp_base, tau_lmr_base=tau_lmr_base)
         self.lmr_net = LMRMoveNetwork(in_dim=16, hidden_dim=16, scale=self.WEIGHT_SCALE)
 
-    def forward(self, u_node, x_quiet, x_cap, x_lmr):
+    def forward(self, u_node, t_quiet, x_lmr):
         w_quiet, z_latents, tau_mp, tau_lmr = self.node_net(u_node)
-        z_quiet, quiet_scores = self.quiet_net(x_quiet, w_quiet)
-        z_cap, cap_scores = self.cap_net(x_cap, z_latents)
+        
+        # Linear combination of 10 handcrafted terms
+        # t_quiet: (B, M, 10), w_quiet: (B, 10)
+        w_exp = w_quiet.unsqueeze(1)
+        score_float = (t_quiet * w_exp).sum(dim=-1)
+        
+        # Fixed point integer simulation: (sum * 256 + 128) >> 8
+        score_int = torch.floor(((t_quiet * torch.round(w_exp * 256.0)).sum(dim=-1) + 128.0) / 256.0)
+        quiet_scores = score_float + (score_int - score_float).detach()
+        z_quiet = quiet_scores / 32768.0
+
         lmr_reductions = self.lmr_net(x_lmr, z_latents)
-        return w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, cap_scores, lmr_reductions
+        return w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, lmr_reductions
 
     def export_quantized_binary(self, filepath: str):
         with open(filepath, "wb") as f:
@@ -218,8 +182,8 @@ class DualMiniNN(nn.Module):
                 self.VERSION,
                 16,
                 32,
-                26,
-                16,
+                20,
+                10,
                 16,
                 self.WEIGHT_SCALE
             ]
@@ -233,19 +197,12 @@ class DualMiniNN(nn.Module):
                 w_q = np.clip(np.round(w * self.WEIGHT_SCALE), -127, 127).astype(np.int8)
                 f.write(w_q.tobytes())
 
-            # 1. Node Network (16 -> 32 -> 32 -> 26)
+            # 1. Node Network (16 -> 32 -> 32 -> 20)
             write_layer(self.node_net.fc0)
             write_layer(self.node_net.fc1)
             write_layer(self.node_net.fc2)
 
-            # 2. Quiet Network (12 -> 16)
-            write_layer(self.quiet_net.fc0)
-
-            # 3. Capture Network (12 -> 16 -> 1)
-            write_layer(self.cap_net.fc0)
-            write_layer(self.cap_net.fc1)
-
-            # 4. LMR Network (16 -> 16 -> 1)
+            # 2. LMR Network (16 -> 16 -> 1)
             write_layer(self.lmr_net.fc0)
             write_layer(self.lmr_net.fc1)
 
@@ -267,15 +224,8 @@ class DualMiniNN(nn.Module):
             # 1. Node Network
             read_layer(self.node_net.fc0, 32, 16)
             read_layer(self.node_net.fc1, 32, 32)
-            read_layer(self.node_net.fc2, 26, 32)
+            read_layer(self.node_net.fc2, 20, 32)
 
-            # 2. Quiet Network
-            read_layer(self.quiet_net.fc0, 16, 12)
-
-            # 3. Capture Network
-            read_layer(self.cap_net.fc0, 16, 12)
-            read_layer(self.cap_net.fc1, 1, 16)
-
-            # 4. LMR Network
+            # 2. LMR Network
             read_layer(self.lmr_net.fc0, 16, 16)
             read_layer(self.lmr_net.fc1, 1, 16)
