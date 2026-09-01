@@ -1650,10 +1650,6 @@ def main():
     parser.add_argument("--output", type=str, default="floored_dual_64it.miniNN", help="Output model binary path")
 
     args = parser.parse_args()
-    if args.movepicker_only:
-        args.train_mode = "movepicker"
-    elif args.lmr_only:
-        args.train_mode = "lmr"
 
     t_teacher_lmr_cfg, t_teacher_mp_cfg, tau_student_lmr_cfg, tau_student_mp_cfg, floor_lmr, floor_mp = load_calibration_parameters()
     t_teacher_lmr = args.t_teacher_lmr if args.t_teacher_lmr is not None else t_teacher_lmr_cfg
@@ -1661,7 +1657,14 @@ def main():
     tau_student_lmr = args.tau_student_lmr if args.tau_student_lmr is not None else tau_student_lmr_cfg
     tau_student_mp = args.tau_student_mp if args.tau_student_mp is not None else tau_student_mp_cfg
 
-    mode_display = "MovePicker Only (Master LMR)" if args.train_mode == "movepicker" else ("LMR Only (Master MovePicker)" if args.train_mode == "lmr" else "Dual (MovePicker + LMR)")
+    if args.train_mode == "staged":
+        mode_display = "3-Stage Staged (Off-Policy MP -> On-Policy MP -> Joint Polish)"
+    elif args.train_mode == "movepicker":
+        mode_display = "MovePicker Only (Master LMR)"
+    elif args.train_mode == "lmr":
+        mode_display = "LMR Only (Master MovePicker)"
+    else:
+        mode_display = "Dual Joint (MovePicker + LMR)"
 
     print("=" * 80, flush=True)
     print("   ON-POLICY CLOSED-LOOP DUAL MINI-NN TRAINER (FULL POLICY SEARCH ALLOCATION)", flush=True)
