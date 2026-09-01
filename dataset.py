@@ -73,21 +73,22 @@ def extract_node_features_from_data(s: dict) -> Optional[torch.Tensor]:
 
 
 def extract_quiet_terms_from_data(m_data: dict, ply: int = 16) -> torch.Tensor:
-    t = np.zeros(10, dtype=np.float32)
-    if "t_quiet" in m_data and len(m_data["t_quiet"]) >= 10:
-        t = np.array(m_data["t_quiet"][:10], dtype=np.float32)
-    elif "x_quiet" in m_data and len(m_data["x_quiet"]) >= 10:
-        xq = np.array(m_data["x_quiet"][:10], dtype=np.float32)
-        t[0] = xq[0] * 512.0                  # 2 * mainHistory
-        t[1] = xq[1] * 512.0                  # 2 * pawnHistory
-        t[2] = xq[2] * 256.0                  # contHistory[0]
-        t[3] = xq[3] * 256.0                  # contHistory[1]
-        t[4] = xq[4] * 256.0                  # contHistory[2]
-        t[5] = xq[5] * 256.0                  # contHistory[3]
-        t[6] = xq[6] * 256.0                  # contHistory[5]
-        t[7] = 16384.0 if xq[7] > 0 else 0.0  # check bonus
-        t[8] = xq[8] * (18000.0 / 64.0)       # threat bonus/penalty
-        t[9] = xq[9] * 2048.0                 # 8 * lowPlyHistory (8 * 256)
+    t = np.zeros(8, dtype=np.float32)
+    if "t_quiet" in m_data:
+        t_arr = np.array(m_data["t_quiet"], dtype=np.float32)
+        if len(t_arr) >= 8:
+            if len(t_arr) == 8:
+                t = t_arr[:8]
+            else:
+                # Backward compatibility: collapse 10 terms to 8
+                t[0] = t_arr[0]
+                t[1] = t_arr[1]
+                t[2] = t_arr[2]
+                t[3] = t_arr[3]
+                t[4] = t_arr[4] + t_arr[5] + t_arr[6] # deep even cont
+                t[5] = t_arr[7]                       # checks
+                t[6] = t_arr[8]                       # threat
+                t[7] = t_arr[9]                       # low ply
     elif "stat_score" in m_data:
         t[0] = float(m_data.get("stat_score", 0))
     return torch.from_numpy(t)
@@ -96,34 +97,38 @@ def extract_quiet_terms_from_data(m_data: dict, ply: int = 16) -> torch.Tensor:
 def extract_lmr_features_from_data(m_data: dict, tt_pv: bool = False, cut_node: bool = False, improving: bool = True, depth: int = 16, root_delta: int = 200, tt_capture: bool = False) -> torch.Tensor:
     x = np.zeros(8, dtype=np.float32)
     if "x_lmr" in m_data and len(m_data["x_lmr"]) >= 8:
-        return torch.from_numpy(np.array(m_data["x_lmr"][:8], dtype=np.float32) / 64.0)
+        return torch.from_numpy(np.array(m_data["x_lmr"][:8], dtype=np.float32))
     
     # 0: -delta / rootDelta
     delta = float(m_data.get("delta", 50))
     rd = float(root_delta if root_delta > 0 else 200)
-    x[0] = -delta / rd
+    x[0] = (-delta * 1024.0) / rd
 
     # 1: !improving * scale / 512
-    scale = float(min(depth, 32) * min(m_data.get("picker_rank", 1), 64)) # approx reductionScale
-    x[1] = (0.0 if improving else 1.0) * scale / 512.0
+    d_idx = min(depth, 31)
+    mc_idx = min(m_data.get("picker_rank", 1), 63)
+    red_scale = math.log(max(1, d_idx)) * math.log(max(1, mc_idx)) * 500.0
+    x[1] = (0.0 if improving else 1.0) * (red_scale * 1024.0) / 512.0
 
-    # 2: base offset in reduction()
-    x[2] = 1.0
+    # 2: base offset
+    x[2] = 1024.0
 
     # 3: -ttPv
-    x[3] = -1.0 if tt_pv else 0.0
+    x[3] = -1024.0 if tt_pv else 0.0
 
-    # 4: base offset 697 in Step 18
-    x[4] = 1.0
-
-    # 5: -moveCount
+    # 4: -moveCount
     rank = float(m_data.get("picker_rank", 1))
-    x[5] = -rank
+    x[4] = -rank * 1024.0
 
-    # 6: cutNode
-    x[6] = 1.0 if cut_node else 0.0
+    # 5: cutNode
+    x[5] = 1024.0 if cut_node else 0.0
 
-    # 7: ttCapture
-    x[7] = 1.0 if tt_capture else 0.0
+    # 6: statScore
+    stat = float(m_data.get("stat_score", 0))
+    x[6] = (-stat * 1024.0) / 4096.0
+
+    # 7: eval margin
+    x[7] = 0.0
 
     return torch.from_numpy(x)
+
