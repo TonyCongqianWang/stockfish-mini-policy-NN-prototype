@@ -90,7 +90,7 @@ class NodeNetwork(nn.Module):
             self.fc2.bias.data.zero_()
             self.fc2.weight.data.normal_(0.0, 0.01)
 
-    def forward(self, u):
+    def forward(self, u, detach_lmr_backbone: bool = False):
         u_q = quantize_ste(u, self.scale)
         u_int = torch.clamp(torch.round(u * self.scale), -127.0, 127.0)
 
@@ -117,8 +117,24 @@ class NodeNetwork(nn.Module):
         b2_int = torch.round(self.fc2.bias * (self.scale * self.scale))
         b2_q = b2_int / (self.scale * self.scale)
 
-        out_float = F.linear(h1, w2_q, b2_q)
-        out_int = F.linear(h1_int, w2_int, b2_int)
+        if detach_lmr_backbone:
+            # MP head receives full gradient through shared representation h1
+            mp_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 18]
+            out_mp_float = F.linear(h1, w2_q[mp_indices], b2_q[mp_indices])
+            out_mp_int = F.linear(h1_int, w2_int[mp_indices], b2_int[mp_indices])
+
+            # LMR head trains on detached representation h1.detach() (zero gradient to fc0/fc1)
+            lmr_indices = [10, 11, 12, 13, 14, 15, 16, 17, 19]
+            h1_det = h1.detach()
+            h1_int_det = h1_int.detach()
+            out_lmr_float = F.linear(h1_det, w2_q[lmr_indices], b2_q[lmr_indices])
+            out_lmr_int = F.linear(h1_int_det, w2_int[lmr_indices], b2_int[lmr_indices])
+
+            out_float = torch.cat([out_mp_float[:, 0:10], out_lmr_float[:, 0:8], out_mp_float[:, 10:11], out_lmr_float[:, 8:9]], dim=-1)
+            out_int = torch.cat([out_mp_int[:, 0:10], out_lmr_int[:, 0:8], out_mp_int[:, 10:11], out_lmr_int[:, 8:9]], dim=-1)
+        else:
+            out_float = F.linear(h1, w2_q, b2_q)
+            out_int = F.linear(h1_int, w2_int, b2_int)
 
         # 0..9: 10 dynamic residual weights for handcrafted quiet terms (scale 256, range [-512, 512])
         w_mp_raw = torch.clamp(out_float[:, 0:10], -2.0, 2.0)
@@ -150,8 +166,8 @@ class DualMiniNN(nn.Module):
         super().__init__()
         self.node_net = NodeNetwork(in_dim=16, hidden_dim=32, out_dim=20, scale=self.WEIGHT_SCALE, tau_mp_base=tau_mp_base, tau_lmr_base=tau_lmr_base)
 
-    def forward(self, u_node, t_quiet, t_lmr):
-        w_mp, w_lmr, tau_mp, tau_lmr = self.node_net(u_node)
+    def forward(self, u_node, t_quiet, t_lmr, detach_lmr_backbone: bool = False):
+        w_mp, w_lmr, tau_mp, tau_lmr = self.node_net(u_node, detach_lmr_backbone=detach_lmr_backbone)
         
         # 1. Residual combination of 10 handcrafted quiet terms: Base Master Score + delta_score (Scale 256)
         base_score = t_quiet.sum(dim=-1)

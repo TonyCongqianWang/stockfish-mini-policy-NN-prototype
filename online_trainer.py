@@ -481,15 +481,16 @@ def compute_combined_losses(
     depth: torch.Tensor,
     w_mp: Optional[torch.Tensor] = None,
     w_lmr: Optional[torch.Tensor] = None,
-    reg_coef: float = 0.05,
-    lmr_ord_coef: float = 0.50,
+    mp_reg_coef: float = 0.05,
+    lmr_reg_coef: float = 0.05,
+    lmr_loss_coef: float = 0.50,
     train_mode: str = "both"
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Direct Residual Formulation Losses:
     1. MovePicker: Monty KL divergence on quiet moves.
     2. LMR: Direct Physical Search Effort Allocation (Monty policy-weighted KL).
-    3. Output Minimization: L2 regularization on residual weights (w_mp and w_lmr) around 0.
+    3. Output Minimization: Independent L2 regularization on MP residual weights (w_mp) and LMR residual weights (w_lmr).
     """
     B, M = z_quiet.shape
 
@@ -529,23 +530,18 @@ def compute_combined_losses(
     Q_dist = E_eff / (D + 1e-12)
     loss_lmr_order = (w_depth * -(target_p_lmr * torch.log(Q_dist + 1e-12)).sum(dim=-1)).mean()
 
-    # 4. Pure Output Minimization / Residual Regularization (L2 norm on residual outputs)
-    loss_reg = torch.tensor(0.0, device=z_quiet.device)
-    if w_mp is not None and w_lmr is not None:
-        loss_reg = w_mp.pow(2).mean() + w_lmr.pow(2).mean()
-    elif w_mp is not None:
-        loss_reg = w_mp.pow(2).mean()
-    elif w_lmr is not None:
-        loss_reg = w_lmr.pow(2).mean()
+    # 4. Pure Output Minimization / Residual Regularization (Independent for MP and LMR)
+    loss_mp_reg = w_mp.pow(2).mean() if w_mp is not None else torch.tensor(0.0, device=z_quiet.device)
+    loss_lmr_reg = w_lmr.pow(2).mean() if w_lmr is not None else torch.tensor(0.0, device=z_quiet.device)
 
     if train_mode == "movepicker":
-        loss_total = loss_mp_kl_q + reg_coef * loss_reg
+        loss_total = loss_mp_kl_q + mp_reg_coef * loss_mp_reg
     elif train_mode == "lmr":
-        loss_total = lmr_ord_coef * loss_lmr_order + reg_coef * loss_reg
+        loss_total = lmr_loss_coef * loss_lmr_order + lmr_reg_coef * loss_lmr_reg
     else:
-        loss_total = loss_mp_kl_q + lmr_ord_coef * loss_lmr_order + reg_coef * loss_reg
+        loss_total = loss_mp_kl_q + mp_reg_coef * loss_mp_reg + lmr_loss_coef * loss_lmr_order + lmr_reg_coef * loss_lmr_reg
 
-    return loss_total, loss_mp_kl_q, loss_lmr_order, loss_reg, acc_q
+    return loss_total, loss_mp_kl_q, loss_lmr_order, loss_mp_reg, loss_lmr_reg, acc_q
 
 
 def compute_standardized_rollout_metrics(
@@ -697,14 +693,15 @@ def evaluate_handcrafted_master(
 def evaluate_validation_rollout(
     model: DualMiniNN,
     loader: DataLoader,
-    mp_anchor_coef: float = 0.05,
-    lmr_ord_coef: float = 0.50,
+    mp_reg_coef: float = 0.05,
+    lmr_reg_coef: float = 0.05,
+    lmr_loss_coef: float = 0.50,
     tau_lmr: float = 1.5,
     train_mode: str = "both",
     is_live_rollout: bool = True
 ) -> Dict[str, float]:
     model.eval()
-    tot_loss_sum, w_anc_sum = 0.0, 0.0
+    tot_loss_sum, mp_reg_sum, lmr_reg_sum = 0.0, 0.0, 0.0
     stat_sums = {}
     total_count = 0
 
@@ -714,9 +711,9 @@ def evaluate_validation_rollout(
 
             z_quiet = quiet_scores / 32768.0
 
-            loss, loss_mp_kl_q, loss_lmr_ord, loss_reg, acc_q = compute_combined_losses(
+            loss, loss_mp_kl_q, loss_lmr_ord, loss_mp_reg, loss_lmr_reg, acc_q = compute_combined_losses(
                 z_quiet, delta_r_nn, tau_mp, tau_lmr_pred, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
-                w_mp=w_mp, w_lmr=w_lmr, reg_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, train_mode=train_mode
+                w_mp=w_mp, w_lmr=w_lmr, mp_reg_coef=mp_reg_coef, lmr_reg_coef=lmr_reg_coef, lmr_loss_coef=lmr_loss_coef, train_mode=train_mode
             )
 
             max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
@@ -745,7 +742,8 @@ def evaluate_validation_rollout(
             B = u_node.size(0)
             total_count += B
             tot_loss_sum += loss.item() * B
-            w_anc_sum += loss_reg.item() * B
+            mp_reg_sum += loss_mp_reg.item() * B
+            lmr_reg_sum += loss_lmr_reg.item() * B
 
             for k, v in b_stats.items():
                 stat_sums[k] = stat_sums.get(k, 0.0) + v * B
@@ -754,7 +752,8 @@ def evaluate_validation_rollout(
     n = max(1, total_count)
     res = {k: v / n for k, v in stat_sums.items()}
     res["total_loss"] = tot_loss_sum / n
-    res["w_anchor_loss"] = w_anc_sum / n
+    res["mp_reg_loss"] = mp_reg_sum / n
+    res["lmr_reg_loss"] = lmr_reg_sum / n
     return res
 
 
@@ -1334,9 +1333,9 @@ def run_heldout_online_evaluation(
 def train_single_run(
     run_name: str,
     lr: float,
-    mp_anchor_coef: float,
-    lmr_ord_coef: float,
-    rank_profile_coef: float,
+    mp_reg_coef: float,
+    lmr_reg_coef: float,
+    lmr_loss_coef: float,
     args: argparse.Namespace,
     val_loader: DataLoader,
     val_dataset: RolloutDataset,
@@ -1362,9 +1361,9 @@ def train_single_run(
     print(f"Replay Window:              {args.replay_window_iters} iters ({args.replay_window_iters * args.rollout_samples:,} total window samples)", flush=True)
     print(f"Mini-Batch Size:            {args.minibatch_size}", flush=True)
     print(f"PPO Multi-Epochs / Iter:    {args.ppo_epochs}", flush=True)
-    print(f"MovePicker Anchor Coef:     {mp_anchor_coef:.2f}", flush=True)
-    print(f"LMR Policy KL Coef:         {lmr_ord_coef:.2f}", flush=True)
-    print(f"Rank-Profile MSE Coef:      {rank_profile_coef:.2f}", flush=True)
+    print(f"MP Residual Reg Coef:       {mp_reg_coef:.4f}", flush=True)
+    print(f"LMR Residual Reg Coef:      {lmr_reg_coef:.4f}", flush=True)
+    print(f"LMR Policy KL Coef:         {lmr_loss_coef:.4f}", flush=True)
     print(f"Teacher Temperatures:       MP: {t_teacher_mp:.4f} | LMR: {t_teacher_lmr:.4f}", flush=True)
     print(f"Student Temperatures:       MP: {tau_student_mp:.4f} | LMR: {tau_student_lmr:.4f}", flush=True)
     print(f"Output Binary:              {output_path}", flush=True)
@@ -1390,9 +1389,8 @@ def train_single_run(
         )
 
     train_mode = getattr(args, "train_mode", "both")
-    use_mp = (train_mode != "lmr")
-    use_lmr = (train_mode != "movepicker")
-    mode_str = "MovePicker Only" if train_mode == "movepicker" else ("LMR Only" if train_mode == "lmr" else "Dual MP+LMR")
+    staged_s1_end = args.offpolicy_iterations
+    staged_s2_end = args.offpolicy_iterations + max(1, (args.iterations - args.offpolicy_iterations) // 2)
 
     model = DualMiniNN(tau_mp_base=tau_student_mp, tau_lmr_base=tau_student_lmr)
     model.export_quantized_binary(output_path)
@@ -1417,30 +1415,65 @@ def train_single_run(
 
     for iteration in range(1, args.iterations + 1):
         t0 = time.time()
-        is_offpolicy = (iteration <= args.offpolicy_iterations) and (offpolicy_dataset is not None)
+
+        if train_mode == "staged":
+            if iteration <= staged_s1_end:
+                phase_tag = "Stage 1 (Off-Policy MP + Detached LMR)"
+                mode_str = "Staged (S1)"
+                is_offpolicy = (offpolicy_dataset is not None)
+                use_mp = True
+                use_lmr = False
+                detach_lmr = True
+            elif iteration <= staged_s2_end:
+                phase_tag = "Stage 2 (On-Policy MP + Detached LMR)"
+                mode_str = "Staged (S2)"
+                is_offpolicy = False
+                use_mp = True
+                use_lmr = False
+                detach_lmr = True
+            else:
+                phase_tag = "Stage 3 (Joint On-Policy MP+LMR)"
+                mode_str = "Staged (S3 Joint)"
+                is_offpolicy = False
+                use_mp = True
+                use_lmr = True
+                detach_lmr = False
+        else:
+            is_offpolicy = (iteration <= args.offpolicy_iterations) and (offpolicy_dataset is not None)
+            phase_tag = "Off-Policy" if is_offpolicy else "On-Policy"
+            use_mp = (train_mode != "lmr")
+            use_lmr = (train_mode != "movepicker")
+            detach_lmr = False
+            mode_str = "MovePicker Only" if train_mode == "movepicker" else ("LMR Only" if train_mode == "lmr" else "Dual MP+LMR")
 
         if is_offpolicy:
-            phase_tag = "Off-Policy"
             buf_len = len(offpolicy_dataset)
             indices = torch.randperm(buf_len)[:min(buf_len, args.rollout_samples)].tolist()
             iter_subset = torch.utils.data.Subset(offpolicy_dataset, indices)
             train_loader = DataLoader(iter_subset, batch_size=args.minibatch_size, shuffle=True)
             fresh_tel, fresh_db = "", ""
 
-            # Vectorized Live Stats pass on off-policy batch
             fresh_loader = DataLoader(iter_subset, batch_size=len(iter_subset), shuffle=False)
             live_stats = evaluate_validation_rollout(
                 model, fresh_loader,
-                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef,
+                mp_reg_coef=mp_reg_coef, lmr_reg_coef=lmr_reg_coef, lmr_loss_coef=lmr_loss_coef,
                 tau_lmr=tau_student_lmr, train_mode=train_mode
             )
         else:
-            if iteration == args.offpolicy_iterations + 1 and args.offpolicy_iterations > 0:
+            if train_mode == "staged":
+                if iteration == staged_s1_end + 1:
+                    print("\n" + "=" * 80, flush=True)
+                    print("   >>> STAGE 2: ON-POLICY MOVEPICKER + DETACHED LMR REFINEMENT <<<", flush=True)
+                    print("=" * 80 + "\n", flush=True)
+                elif iteration == staged_s2_end + 1:
+                    print("\n" + "=" * 80, flush=True)
+                    print("   >>> STAGE 3: FULL DUAL ON-POLICY JOINT POLISH (MP + LMR) <<<", flush=True)
+                    print("=" * 80 + "\n", flush=True)
+            elif iteration == args.offpolicy_iterations + 1 and args.offpolicy_iterations > 0:
                 print("\n" + "=" * 80, flush=True)
                 print(f"   >>> SWITCHING TO PHASE 2: ON-POLICY NEURAL SEARCH REFINEMENT ({mode_str.upper()}) <<<", flush=True)
                 print("=" * 80 + "\n", flush=True)
 
-            phase_tag = "On-Policy"
             fresh_tel, fresh_db, curr_fen_offset = collect_target_samples(
                 fens_pool=train_fens_pool,
                 fen_offset=curr_fen_offset,
@@ -1463,16 +1496,14 @@ def train_single_run(
                 t_teacher_mp=t_teacher_mp
             )
 
-            # Vectorized Live Stats pass on fresh on-policy rollout (Zero Extra Cost)
             fresh_loader = DataLoader(curr_dataset, batch_size=len(curr_dataset), shuffle=False)
             live_stats = evaluate_validation_rollout(
                 model, fresh_loader,
-                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef,
+                mp_reg_coef=mp_reg_coef, lmr_reg_coef=lmr_reg_coef, lmr_loss_coef=lmr_loss_coef,
                 tau_lmr=tau_student_lmr, train_mode=train_mode,
                 is_live_rollout=True
             )
 
-            # Maintain sliding replay window across iterations
             onpolicy_datasets_window.append((curr_dataset, fresh_tel, fresh_db))
             if len(onpolicy_datasets_window) > args.replay_window_iters:
                 old_ds, old_tel, old_db = onpolicy_datasets_window.pop(0)
@@ -1491,18 +1522,19 @@ def train_single_run(
             train_loader = DataLoader(train_dataset, batch_size=args.minibatch_size, shuffle=True)
 
         iter_steps = 0
-        iter_loss, iter_mp_kl_q, iter_w_anc, iter_lmr_ord = 0.0, 0.0, 0.0, 0.0
+        iter_loss, iter_mp_kl_q, iter_mp_reg, iter_lmr_ord, iter_lmr_reg = 0.0, 0.0, 0.0, 0.0, 0.0
+        iter_rms_mp, iter_rms_lmr = 0.0, 0.0
 
         for epoch in range(args.ppo_epochs):
             for u_node, t_quiet, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in train_loader:
                 optimizer.zero_grad()
-                w_mp, w_lmr, tau_mp, tau_lmr, quiet_scores, delta_r_nn = model(u_node, t_quiet, x_lmr)
+                w_mp, w_lmr, tau_mp, tau_lmr, quiet_scores, delta_r_nn = model(u_node, t_quiet, x_lmr, detach_lmr_backbone=detach_lmr)
 
                 z_quiet = quiet_scores / 32768.0
 
-                loss, loss_mp_kl_q, loss_lmr_ord, loss_reg, _ = compute_combined_losses(
+                loss, loss_mp_kl_q, loss_lmr_ord, loss_mp_reg, loss_lmr_reg, _ = compute_combined_losses(
                     z_quiet, delta_r_nn, tau_mp, tau_lmr, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
-                    w_mp=w_mp, w_lmr=w_lmr, reg_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, train_mode=train_mode
+                    w_mp=w_mp, w_lmr=w_lmr, mp_reg_coef=mp_reg_coef, lmr_reg_coef=lmr_reg_coef, lmr_loss_coef=lmr_loss_coef, train_mode=train_mode
                 )
 
                 loss.backward()
@@ -1514,8 +1546,11 @@ def train_single_run(
                 iter_steps += 1
                 iter_loss += loss.item()
                 iter_mp_kl_q += loss_mp_kl_q.item()
-                iter_w_anc += loss_reg.item()
+                iter_mp_reg += loss_mp_reg.item()
                 iter_lmr_ord += loss_lmr_ord.item()
+                iter_lmr_reg += loss_lmr_reg.item()
+                iter_rms_mp += torch.sqrt(w_mp.pow(2).mean()).item()
+                iter_rms_lmr += (torch.sqrt(w_lmr.pow(2).mean()) / 16.0).item()
 
                 if total_gradient_steps % args.sync_interval == 0:
                     model.export_quantized_binary(output_path)
@@ -1525,21 +1560,21 @@ def train_single_run(
         n_steps = max(1, iter_steps)
 
         live_str = f"Live Search: Top1:{live_stats['top1_match']:4.1f}% (Q:{live_stats['quiet_top1']:4.1f}%)"
-        if train_mode != "movepicker":
+        if use_lmr:
             live_str += f", RedTop1:{live_stats['top1_reduction']:4.2f}p, RedLate:{live_stats['late_reduction']:4.2f}p"
 
         if iteration % args.val_freq == 0 or iteration == 1 or iteration == args.iterations:
             val_stats = evaluate_validation_rollout(
                 model, val_loader,
-                mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef,
+                mp_reg_coef=mp_reg_coef, lmr_reg_coef=lmr_reg_coef, lmr_loss_coef=lmr_loss_coef,
                 tau_lmr=tau_student_lmr, train_mode=train_mode
             )
-            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag} | {mode_str})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
-                  f"Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, W_Anc: {iter_w_anc/n_steps:.3f}, LMR: {iter_lmr_ord/n_steps:.3f}) | "
+            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
+                  f"Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, LMR_KL: {iter_lmr_ord/n_steps:.3f} | RMS_MP: {iter_rms_mp/n_steps:.4f}, RMS_LMR: {iter_rms_lmr/n_steps:.4f}p) | "
                   f"{live_str} | Val MP: (Q:{val_stats['quiet_top1']:4.1f}%) | Val Loss: {val_stats['total_loss']:.4f}", flush=True)
         else:
-            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag} | {mode_str})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
-                  f"Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, W_Anc: {iter_w_anc/n_steps:.3f}, LMR: {iter_lmr_ord/n_steps:.3f}) | {live_str}", flush=True)
+            print(f"[{run_name} | Iter {iteration:>4d}/{args.iterations} ({phase_tag})] ({elapsed_iter:4.1f}s | lr: {curr_lr:.4e}) "
+                  f"Loss: {iter_loss/n_steps:.4f} (MP_Q: {iter_mp_kl_q/n_steps:.3f}, LMR_KL: {iter_lmr_ord/n_steps:.3f} | RMS_MP: {iter_rms_mp/n_steps:.4f}, RMS_LMR: {iter_rms_lmr/n_steps:.4f}p) | {live_str}", flush=True)
 
     # Clean up any remaining sliding window temp files
     for _, old_tel, old_db in onpolicy_datasets_window:
@@ -1553,7 +1588,7 @@ def train_single_run(
 
     final_stats = evaluate_validation_rollout(
         model, val_loader,
-        mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef,
+        mp_reg_coef=mp_reg_coef, lmr_reg_coef=lmr_reg_coef, lmr_loss_coef=lmr_loss_coef,
         tau_lmr=tau_student_lmr, train_mode=train_mode
     )
     model.export_quantized_binary(output_path)
@@ -1582,9 +1617,10 @@ def main():
     parser = argparse.ArgumentParser(description="On-Policy Dual Mini-NN Closed-Loop Trainer & Grid Runner.")
     parser.add_argument("--iterations", type=int, default=128, help="Total outer iterations per run (default: 128)")
     parser.add_argument("--offpolicy-iterations", type=int, default=16, help="Number of initial off-policy warmup iterations using Master movepicker & LMR before switching to on-policy (default: 16)")
-    parser.add_argument("--train-mode", type=str, choices=["both", "movepicker", "lmr"], default="both", help="Training mode: 'movepicker' (MP only, Master LMR), 'lmr' (LMR only, Master MP), 'both' (dual joint MP+LMR) (default: both)")
-    parser.add_argument("--movepicker-only", action="store_true", help="Shortcut for --train-mode movepicker")
-    parser.add_argument("--lmr-only", action="store_true", help="Shortcut for --train-mode lmr")
+    parser.add_argument("--train-mode", type=str, choices=["both", "movepicker", "lmr", "staged"], default="staged", help="Training mode: 'staged' (3-stage MP->LMR->Joint), 'movepicker' (MP only), 'lmr' (LMR only), 'both' (dual joint) (default: staged)")
+    parser.add_argument("--staged", dest="train_mode", action="store_const", const="staged", help="Shortcut for --train-mode staged")
+    parser.add_argument("--movepicker-only", dest="train_mode", action="store_const", const="movepicker", help="Shortcut for --train-mode movepicker")
+    parser.add_argument("--lmr-only", dest="train_mode", action="store_const", const="lmr", help="Shortcut for --train-mode lmr")
     parser.add_argument("--rollout-samples", "--replay-buffer-size", dest="rollout_samples", type=int, default=4096, help="Fresh on-policy rollout buffer size per iteration (default: 4096)")
     parser.add_argument("--replay-window-iters", type=int, default=4, help="Sliding replay window in iterations (accumulates last K iterations for training) (default: 4)")
     parser.add_argument("--minibatch-size", type=int, default=256, help="Minibatch size for SGD updates (default: 256)")
@@ -1602,9 +1638,9 @@ def main():
     parser.add_argument("--workers", type=int, default=6, help="Parallel worker threads (default: 6)")
     parser.add_argument("--grid", action="store_true", help="Run the 3-experiment hyperparameter grid")
     parser.add_argument("--lr", type=float, default=4e-3, help="Peak learning rate (default: 4e-3)")
-    parser.add_argument("--mp-anchor-coef", type=float, default=0.20, help="MovePicker anchor weight (default: 0.20)")
-    parser.add_argument("--lmr-ord-coef", type=float, default=0.40, help="LMR policy cross-entropy weight (default: 0.40)")
-    parser.add_argument("--rank-profile-coef", type=float, default=0.40, help="Rank profile MSE loss weight (default: 0.40)")
+    parser.add_argument("--mp-reg-coef", "--mp-anchor-coef", dest="mp_reg_coef", type=float, default=0.05, help="MovePicker residual weights L2 regularization weight (default: 0.05)")
+    parser.add_argument("--lmr-reg-coef", dest="lmr_reg_coef", type=float, default=0.05, help="LMR residual weights L2 regularization weight (default: 0.05)")
+    parser.add_argument("--lmr-loss-coef", "--lmr-ord-coef", dest="lmr_loss_coef", type=float, default=0.50, help="LMR policy search effort KL loss weight (default: 0.50)")
     parser.add_argument("--auto-align-temperatures", action="store_true", default=True, help="Automatically align student logit variance to teacher target log-probability variance on the validation dataset (default: True)")
     parser.add_argument("--no-auto-align-temperatures", dest="auto_align_temperatures", action="store_false", help="Disable automatic student variance matching")
     parser.add_argument("--t-teacher-mp", type=float, default=None, help="Teacher shaping temperature for MovePicker (default from config or 0.50)")
@@ -1718,11 +1754,11 @@ def main():
     if args.grid:
         grid_configs = [
             {
-                "name": "Run1_Residual_LMR40",
+                "name": "Run1_Staged_Reg05_LMR50",
                 "lr": 4e-3,
-                "mp_anchor": 0.20,
-                "lmr_ord": 0.40,
-                "rank_profile": 0.40,
+                "mp_reg": 0.05,
+                "lmr_reg": 0.05,
+                "lmr_loss": 0.50,
                 "output": "floored_dual_64it.miniNN"
             },
         ]
@@ -1732,9 +1768,9 @@ def main():
             stats = train_single_run(
                 run_name=cfg["name"],
                 lr=cfg["lr"],
-                mp_anchor_coef=cfg["mp_anchor"],
-                lmr_ord_coef=cfg["lmr_ord"],
-                rank_profile_coef=cfg["rank_profile"],
+                mp_reg_coef=cfg["mp_reg"],
+                lmr_reg_coef=cfg["lmr_reg"],
+                lmr_loss_coef=cfg["lmr_loss"],
                 args=args,
                 val_loader=val_loader,
                 val_dataset=val_dataset,
@@ -1781,9 +1817,9 @@ def main():
         final_stats = train_single_run(
             run_name="Single_PolicyLMR_Run",
             lr=args.lr,
-            mp_anchor_coef=args.mp_anchor_coef,
-            lmr_ord_coef=args.lmr_ord_coef,
-            rank_profile_coef=args.rank_profile_coef,
+            mp_reg_coef=args.mp_reg_coef,
+            lmr_reg_coef=args.lmr_reg_coef,
+            lmr_loss_coef=args.lmr_loss_coef,
             args=args,
             val_loader=val_loader,
             val_dataset=val_dataset,
