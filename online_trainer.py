@@ -515,10 +515,10 @@ def compute_combined_losses(
         loss_mp_kl_q = (w_depth[has_quiets] * loss_q_pos).mean()
         acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q_raw[has_quiets].argmax(dim=-1)).float().mean()
 
-    # Weight Regularization / Anchor on w_quiet (around 1.0 = Master baseline)
+    # Weight Regularization / Anchor on w_mp (residuals around 0.0 = Master baseline)
     loss_w_anchor = torch.tensor(0.0, device=z_quiet.device)
     if w_quiet is not None:
-        loss_w_anchor = (w_quiet - 1.0).pow(2).mean()
+        loss_w_anchor = w_quiet.pow(2).mean()
 
     loss_mp_total = loss_mp_kl_q + mp_anchor_coef * loss_w_anchor
 
@@ -707,7 +707,7 @@ def evaluate_validation_rollout(
     rank_profile_coef: float = 0.40,
     tau_lmr: float = 1.5,
     train_mode: str = "both",
-    is_live_rollout: bool = False
+    is_live_rollout: bool = True
 ) -> Dict[str, float]:
     model.eval()
     tot_loss_sum, w_anc_sum, rank_prof_loss_sum = 0.0, 0.0, 0.0
@@ -716,29 +716,35 @@ def evaluate_validation_rollout(
 
     with torch.no_grad():
         for u_node, t_quiet, x_lmr, is_cap, r_base, r_legacy, z_legacy_mp, target_p_mp, target_p_lmr, legal_mask, depth in loader:
-            w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, delta_r_nn = model(u_node, t_quiet, x_lmr)
+            w_quiet, z_latents, tau_mp, tau_lmr_pred, quiet_scores, delta_r_nn = model(u_node, t_quiet, x_lmr)
 
             z_quiet = quiet_scores / 32768.0
 
             loss, loss_mp_kl_q, loss_w_anc, loss_lmr_ord, loss_rank_prof, acc_q = compute_combined_losses(
-                z_quiet, delta_r_nn, tau_mp, tau_lmr, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
+                z_quiet, delta_r_nn, tau_mp, tau_lmr_pred, target_p_mp, target_p_lmr, z_legacy_mp, r_base, r_legacy, is_cap, legal_mask, depth,
                 w_quiet=w_quiet, mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef, train_mode=train_mode
             )
 
-            r_total_nn = r_base + delta_r_nn
             max_red = (depth.unsqueeze(1) - 1.0).clamp(min=0.0)
             min_red = torch.tensor(-2.0, device=delta_r_nn.device)
-            r_real_nn = torch.minimum(torch.maximum(r_total_nn, min_red), max_red)
+
+            if train_mode == "movepicker":
+                r_real_eff = torch.minimum(torch.maximum(r_legacy, min_red), max_red)
+                eff_tau_lmr = torch.tensor(tau_lmr, device=delta_r_nn.device)
+            else:
+                r_total_nn = r_base + delta_r_nn
+                r_real_eff = torch.minimum(torch.maximum(r_total_nn, min_red), max_red)
+                eff_tau_lmr = tau_lmr_pred
 
             b_stats = compute_standardized_rollout_metrics(
                 target_p_mp=target_p_mp,
                 target_p_lmr=target_p_lmr,
-                r_real=r_real_nn,
+                r_real=r_real_eff,
                 z_q=z_quiet,
                 is_cap=is_cap,
                 legal_mask=legal_mask,
                 tau_mp=tau_mp,
-                tau_lmr=tau_lmr,
+                tau_lmr=eff_tau_lmr,
                 is_live_rollout=is_live_rollout
             )
 
@@ -763,8 +769,15 @@ def evaluate_validation_rollout(
 def evaluate_2d_depth_rank_matrix(
     model: nn.Module,
     loader: DataLoader,
-    tau_lmr: float = 1.5
+    tau_lmr: float = 1.5,
+    train_mode: str = "both"
 ):
+    if train_mode == "movepicker":
+        print("\n" + "=" * 80, flush=True)
+        print("  [2D LMR Matrix skipped: MovePicker-only run; LMR is native Stockfish Master]", flush=True)
+        print("=" * 80 + "\n", flush=True)
+        return
+
     model.eval()
     bands = [
         ("Low (d: 2-6)", 2, 6),
@@ -977,7 +990,7 @@ def collect_or_load_offpolicy_buffer(
     nodes_per_fen: int,
     sample_interval: int,
     workers: int,
-    session_tag: str = "master_offpolicy_shared_v4"
+    session_tag: str = "master_offpolicy_shared_v5"
 ) -> Tuple[str, str]:
     """
     Collects or reuses a large Master off-policy replay buffer:
@@ -1140,8 +1153,8 @@ def run_heldout_online_evaluation(
         model.export_quantized_binary(temp_model_path)
 
     if model is None:
-        tel_path = os.path.join(CACHE_DIR, "master_heldout_shared_v4.jsonl")
-        db_path = os.path.join(CACHE_DIR, "master_heldout_shared_v4.db")
+        tel_path = os.path.join(CACHE_DIR, "master_heldout_shared_v5.jsonl")
+        db_path = os.path.join(CACHE_DIR, "master_heldout_shared_v5.db")
     else:
         tel_path = os.path.join(CACHE_DIR, f"heldout_tel_{session_tag}.jsonl")
         db_path = os.path.join(CACHE_DIR, f"heldout_monty_{session_tag}.db")
@@ -1243,7 +1256,8 @@ def run_heldout_online_evaluation(
     if model is None:
         heldout_stats = evaluate_handcrafted_master(heldout_loader, tau_mp=tau_student_mp_calib, tau_lmr=tau_student_lmr_calib)
     else:
-        heldout_stats = evaluate_validation_rollout(model, heldout_loader, tau_lmr=tau_student_lmr_calib)
+        heldout_train_mode = "movepicker" if (not use_lmr and use_mp) else ("lmr" if (use_lmr and not use_mp) else "both")
+        heldout_stats = evaluate_validation_rollout(model, heldout_loader, tau_lmr=tau_student_lmr_calib, train_mode=heldout_train_mode, is_live_rollout=True)
 
     print_unified_benchmark_report("Neural MiniNN Heldout Test Set (1,000 FENs)", heldout_stats)
 
@@ -1481,7 +1495,7 @@ def train_single_run(
     model.export_quantized_binary(output_path)
 
     # Output detailed 2D Depth x Rank Evaluation Matrix
-    evaluate_2d_depth_rank_matrix(model, val_loader, tau_lmr=tau_student_lmr)
+    evaluate_2d_depth_rank_matrix(model, val_loader, tau_lmr=tau_student_lmr, train_mode=train_mode)
 
     # Final Online Testing Step on Heldout FENs (Matching val_samples scale)
     if test_fens_pool and not getattr(args, "skip_heldout_eval", False):
@@ -1584,7 +1598,7 @@ def main():
         target_samples=args.val_samples,
         nodes_per_fen=args.nodes,
         workers=args.workers,
-        session_tag="val_v4_staged_500k_shared"
+        session_tag="val_v5_staged_500k_shared"
     )
 
     val_dataset = RolloutDataset(
@@ -1619,7 +1633,7 @@ def main():
             nodes_per_fen=args.nodes,
             sample_interval=args.sample_interval,
             workers=args.workers,
-            session_tag="master_offpolicy_shared_v4"
+            session_tag="master_offpolicy_shared_v5"
         )
         offpolicy_dataset = RolloutDataset(
             telemetry_path=offpolicy_tel,

@@ -1,12 +1,12 @@
 """
-Mini-NN Engine Architecture (Version 4: Dynamic Handcrafted Quiet Terms Weighting + LMR):
-1. NodeNetwork: 16 -> 32 -> 32 -> 20
+Mini-NN Engine Architecture (Version 5: Dynamic Handcrafted Quiet Terms + LMR Residual Terms):
+1. NodeNetwork: 16 -> 32 -> 32 -> 18
    - 10 dynamic weighting multipliers for handcrafted quiet terms (w_quiet, Scale 256: 256 = 1.0x)
-   - 8 position latents for LMR (z_latents, Scale 64)
+   - 6 dynamic residual weights for LMR formula terms (w_lmr, Scale 64: 64 = 1.0 ply)
    - 1 dynamic temperature for MovePicker (tau_mp)
    - 1 dynamic temperature for LMR (tau_lmr)
-2. Quiet Move Scoring: Direct linear combination of 10 handcrafted terms (T_0..T_9) with w_quiet.
-3. LMRMoveNetwork: (8 raw + 8 latents) = 16 -> 16 -> 1
+2. Quiet Move Scoring: Direct linear combination of 10 handcrafted terms (T_0..T_9) with w_quiet in movepick.cpp.
+3. LMR Residual Reduction: Direct linear combination of 6 LMR terms with w_lmr in search.cpp.
 4. Symmetric Quantization with Straight-Through Estimator (STE).
 """
 
@@ -85,95 +85,88 @@ class NodeNetwork(nn.Module):
         self.act0 = QuantizedClippedReLU(scale)
         self.act1 = QuantizedClippedReLU(scale)
 
-        # Initialize quiet term weights to 1.0 (Master default)
+        # Pure residual initialization: 0.0 everywhere (Master baseline is exact 0 residual)
         with torch.no_grad():
             self.fc2.bias.data.zero_()
-            self.fc2.bias.data[0:10] = 1.0
             self.fc2.weight.data.normal_(0.0, 0.01)
 
     def forward(self, u):
         u_q = quantize_ste(u, self.scale)
-        w0 = quantize_ste(self.fc0.weight, self.scale)
-        b0 = quantize_bias_ste(self.fc0.bias, self.scale * self.scale)
-        h0 = self.act0(F.linear(u_q, w0, b0))
+        u_int = torch.clamp(torch.round(u * self.scale), -127.0, 127.0)
 
-        w1 = quantize_ste(self.fc1.weight, self.scale)
-        b1 = quantize_bias_ste(self.fc1.bias, self.scale * self.scale)
-        h1 = self.act1(F.linear(h0, w1, b1))
+        w0_q = quantize_ste(self.fc0.weight, self.scale)
+        w0_int = torch.clamp(torch.round(self.fc0.weight * self.scale), -127.0, 127.0)
+        b0_int = torch.round(self.fc0.bias * (self.scale * self.scale))
+        b0_q = b0_int / (self.scale * self.scale)
 
-        w2 = quantize_ste(self.fc2.weight, self.scale)
-        b2 = quantize_bias_ste(self.fc2.bias, self.scale * self.scale)
-        out = F.linear(h1, w2, b2)
+        h0_float = self.act0(F.linear(u_q, w0_q, b0_q))
+        h0_int = torch.clamp(torch.floor((F.linear(u_int, w0_int, b0_int) + 32.0) / 64.0), 0.0, 127.0)
+        h0 = h0_float + (h0_int / 64.0 - h0_float).detach()
 
-        # 0..9: 10 dynamic multipliers for handcrafted quiet terms (scale 256, range [-4.0, 4.0])
-        w_quiet_raw = torch.clamp(out[:, 0:10], -4.0, 4.0)
-        w_quiet_q = torch.clamp(torch.round(w_quiet_raw * 256.0), -1024.0, 1024.0) / 256.0
-        w_quiet = w_quiet_raw + (w_quiet_q - w_quiet_raw).detach()
+        w1_q = quantize_ste(self.fc1.weight, self.scale)
+        w1_int = torch.clamp(torch.round(self.fc1.weight * self.scale), -127.0, 127.0)
+        b1_int = torch.round(self.fc1.bias * (self.scale * self.scale))
+        b1_q = b1_int / (self.scale * self.scale)
 
-        # 10..17: 8 position latents for LMR (scale 64, range [-127/64, 127/64])
-        z_latents = quantize_ste(torch.clamp(out[:, 10:18], -127.0 / 64.0, 127.0 / 64.0), 64.0)
+        h1_float = self.act1(F.linear(h0, w1_q, b1_q))
+        h1_int = torch.clamp(torch.floor((F.linear(h0_int, w1_int, b1_int) + 32.0) / 64.0), 0.0, 127.0)
+        h1 = h1_float + (h1_int / 64.0 - h1_float).detach()
+
+        w2_q = quantize_ste(self.fc2.weight, self.scale)
+        w2_int = torch.clamp(torch.round(self.fc2.weight * self.scale), -127.0, 127.0)
+        b2_int = torch.round(self.fc2.bias * (self.scale * self.scale))
+        b2_q = b2_int / (self.scale * self.scale)
+
+        out_float = F.linear(h1, w2_q, b2_q)
+        out_int = F.linear(h1_int, w2_int, b2_int)
+
+        # 0..9: 10 dynamic residual weights for handcrafted quiet terms (scale 256, range [-512, 512])
+        w_mp_raw = torch.clamp(out_float[:, 0:10], -2.0, 2.0)
+        w_mp_q = torch.clamp(torch.floor((out_int[:, 0:10] + 8.0) / 16.0), -512.0, 512.0) / 256.0
+        w_mp = w_mp_raw + (w_mp_q - w_mp_raw).detach()
+
+        # 10..17: 8 dynamic residual weights for LMR terms (scale 64, range [-128, 128])
+        w_lmr_raw = torch.clamp(out_float[:, 10:18], -2.0, 2.0)
+        w_lmr_q = torch.clamp(torch.floor((out_int[:, 10:18] + 32.0) / 64.0), -128.0, 128.0) / 64.0
+        w_lmr = w_lmr_raw + (w_lmr_q - w_lmr_raw).detach()
 
         # 18: log_tau_mp
-        log_tau_mp = out[:, 18:19]
+        log_tau_mp = out_float[:, 18:19]
         tau_mp = self.tau_mp_base * torch.exp(torch.clamp(log_tau_mp, -1.5, 1.5))
 
         # 19: log_tau_lmr
-        log_tau_lmr = out[:, 19:20]
+        log_tau_lmr = out_float[:, 19:20]
         tau_lmr = self.tau_lmr_base * torch.exp(torch.clamp(log_tau_lmr, -1.5, 1.5))
 
-        return w_quiet, z_latents, tau_mp, tau_lmr
-
-
-class LMRMoveNetwork(nn.Module):
-    def __init__(self, in_dim=16, hidden_dim=16, scale=64.0):
-        super().__init__()
-        self.scale = scale
-        self.fc0 = nn.Linear(in_dim, hidden_dim)
-        self.fc1 = nn.Linear(hidden_dim, 1)
-        self.act0 = QuantizedClippedReLU(scale)
-
-    def forward(self, x_raw_lmr, z_latents):
-        B, N, _ = x_raw_lmr.shape
-        z_exp = z_latents.unsqueeze(1).expand(B, N, -1)
-        x_lmr = torch.cat([quantize_ste(x_raw_lmr, self.scale), z_exp], dim=-1)
-
-        w0 = quantize_ste(self.fc0.weight, self.scale)
-        b0 = quantize_bias_ste(self.fc0.bias, self.scale * self.scale)
-        h0 = self.act0(F.linear(x_lmr, w0, b0))
-
-        w1 = quantize_ste(self.fc1.weight, self.scale)
-        b1 = quantize_bias_ste(self.fc1.bias, self.scale * self.scale)
-        r_float = F.linear(h0, w1, b1).squeeze(-1)
-        r_int_1024 = torch.floor((r_float * 4096.0 + 2.0) / 4.0)
-        r_out = r_float + (r_int_1024 / 1024.0 - r_float).detach()
-        return r_out
+        return w_mp, w_lmr, tau_mp, tau_lmr
 
 
 class DualMiniNN(nn.Module):
     MAGIC = 0x4D494E49  # 'MINI'
-    VERSION = 4         # Version 4: Dynamic Quiet Terms (Scale 256) + LMR
+    VERSION = 5         # Version 5: Pure Residual MovePicker (Scale 256) + Residual LMR (Scale 64)
     WEIGHT_SCALE = 64
 
     def __init__(self, tau_mp_base=None, tau_lmr_base=None):
         super().__init__()
         self.node_net = NodeNetwork(in_dim=16, hidden_dim=32, out_dim=20, scale=self.WEIGHT_SCALE, tau_mp_base=tau_mp_base, tau_lmr_base=tau_lmr_base)
-        self.lmr_net = LMRMoveNetwork(in_dim=16, hidden_dim=16, scale=self.WEIGHT_SCALE)
 
-    def forward(self, u_node, t_quiet, x_lmr):
-        w_quiet, z_latents, tau_mp, tau_lmr = self.node_net(u_node)
+    def forward(self, u_node, t_quiet, t_lmr):
+        w_mp, w_lmr, tau_mp, tau_lmr = self.node_net(u_node)
         
-        # Linear combination of 10 handcrafted terms
-        # t_quiet: (B, M, 10), w_quiet: (B, 10)
-        w_exp = w_quiet.unsqueeze(1)
-        score_float = (t_quiet * w_exp).sum(dim=-1)
-        
-        # Fixed point integer simulation: (sum * 256 + 128) >> 8
-        score_int = torch.floor(((t_quiet * torch.round(w_exp * 256.0)).sum(dim=-1) + 128.0) / 256.0)
-        quiet_scores = score_float + (score_int - score_float).detach()
-        z_quiet = quiet_scores / 32768.0
+        # 1. Residual combination of 10 handcrafted quiet terms: Base Master Score + delta_score (Scale 256)
+        base_score = t_quiet.sum(dim=-1)
+        w_exp_mp = w_mp.unsqueeze(1)
+        delta_score_float = (t_quiet * w_exp_mp).sum(dim=-1)
+        delta_score_int = torch.floor(((t_quiet * torch.round(w_exp_mp * 256.0)).sum(dim=-1) + 128.0) / 256.0)
+        quiet_scores = base_score + delta_score_float + (delta_score_int - delta_score_float).detach()
 
-        lmr_reductions = self.lmr_net(x_lmr, z_latents)
-        return w_quiet, z_latents, tau_mp, tau_lmr, quiet_scores, lmr_reductions
+        # 2. Residual combination of 8 LMR terms
+        w_exp_lmr = w_lmr.unsqueeze(1)
+        delta_r_float = (t_lmr * w_exp_lmr).sum(dim=-1)
+        delta_r_int = torch.floor(((t_lmr * torch.round(w_exp_lmr * 64.0)).sum(dim=-1) + 32.0) / 64.0)
+        delta_r_nn = delta_r_float + (delta_r_int - delta_r_float).detach()
+
+        return w_mp, w_lmr, tau_mp, tau_lmr, quiet_scores, delta_r_nn
 
     def export_quantized_binary(self, filepath: str):
         with open(filepath, "wb") as f:
@@ -184,7 +177,7 @@ class DualMiniNN(nn.Module):
                 32,
                 20,
                 10,
-                16,
+                8,
                 self.WEIGHT_SCALE
             ]
             f.write(struct.pack("<8I", *header))
@@ -197,14 +190,10 @@ class DualMiniNN(nn.Module):
                 w_q = np.clip(np.round(w * self.WEIGHT_SCALE), -127, 127).astype(np.int8)
                 f.write(w_q.tobytes())
 
-            # 1. Node Network (16 -> 32 -> 32 -> 20)
+            # Node Network (16 -> 32 -> 32 -> 20)
             write_layer(self.node_net.fc0)
             write_layer(self.node_net.fc1)
             write_layer(self.node_net.fc2)
-
-            # 2. LMR Network (16 -> 16 -> 1)
-            write_layer(self.lmr_net.fc0)
-            write_layer(self.lmr_net.fc1)
 
     def load_quantized_binary(self, filepath: str):
         with open(filepath, "rb") as f:
@@ -221,11 +210,7 @@ class DualMiniNN(nn.Module):
                 w_q = np.frombuffer(w_bytes, dtype=np.int8).reshape(out_dim, in_dim)
                 layer.weight.data.copy_(torch.from_numpy(w_q.astype(np.float32) / self.WEIGHT_SCALE))
 
-            # 1. Node Network
+            # Node Network
             read_layer(self.node_net.fc0, 32, 16)
             read_layer(self.node_net.fc1, 32, 32)
             read_layer(self.node_net.fc2, 20, 32)
-
-            # 2. LMR Network
-            read_layer(self.lmr_net.fc0, 16, 16)
-            read_layer(self.lmr_net.fc1, 1, 16)

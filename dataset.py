@@ -91,20 +91,37 @@ def extract_quiet_terms_from_data(m_data: dict, ply: int = 16) -> torch.Tensor:
     return torch.from_numpy(t)
 
 
-def extract_lmr_features_from_data(m_data: dict, tt_pv: bool = False) -> torch.Tensor:
-    if "x_lmr" in m_data:
-        return torch.from_numpy(np.array(m_data["x_lmr"], dtype=np.float32) / 64.0)
+def extract_lmr_features_from_data(m_data: dict, tt_pv: bool = False, cut_node: bool = False, improving: bool = True, depth: int = 16, root_delta: int = 200, tt_capture: bool = False) -> torch.Tensor:
     x = np.zeros(8, dtype=np.float32)
-    x[0] = np.clip(m_data.get("stat_score", 0) / 2000.0, -1.0, 1.0)
-    rank = m_data.get("picker_rank", 1)
-    x[1] = np.clip((rank - 4.0) / 8.0, -1.0, 1.0)
-    is_cap = m_data.get("is_capture", False)
-    x[2] = 1.0 if is_cap else -1.0
-    cap_val = PIECE_VALS.get(m_data.get("captured_pt", 0), 100) if is_cap else 0
-    x[3] = np.clip(cap_val / 500.0, 0.0, 1.0) if is_cap else 0.0
-    x[4] = 1.0 if m_data.get("gives_check", False) else -1.0
-    x[5] = 1.0 if m_data.get("is_promotion", False) else -1.0
-    moved_pt = m_data.get("moved_pt", 1)
-    x[6] = np.clip((moved_pt - 2.0) / 2.0, -1.0, 1.0)
-    x[7] = 1.0 if tt_pv else -1.0
+    if "x_lmr" in m_data and len(m_data["x_lmr"]) >= 8:
+        return torch.from_numpy(np.array(m_data["x_lmr"][:8], dtype=np.float32) / 64.0)
+    
+    # 0: -delta / rootDelta
+    delta = float(m_data.get("delta", 50))
+    rd = float(root_delta if root_delta > 0 else 200)
+    x[0] = -delta / rd
+
+    # 1: !improving * scale / 512
+    scale = float(min(depth, 32) * min(m_data.get("picker_rank", 1), 64)) # approx reductionScale
+    x[1] = (0.0 if improving else 1.0) * scale / 512.0
+
+    # 2: base offset in reduction()
+    x[2] = 1.0
+
+    # 3: -ttPv
+    x[3] = -1.0 if tt_pv else 0.0
+
+    # 4: base offset 697 in Step 18
+    x[4] = 1.0
+
+    # 5: -moveCount
+    rank = float(m_data.get("picker_rank", 1))
+    x[5] = -rank
+
+    # 6: cutNode
+    x[6] = 1.0 if cut_node else 0.0
+
+    # 7: ttCapture
+    x[7] = 1.0 if tt_capture else 0.0
+
     return torch.from_numpy(x)
