@@ -517,20 +517,48 @@ def compute_combined_losses(
     w_raw = torch.clamp(torch.sqrt(depth.clamp(min=1.0) / 8.0), 0.70, 1.40)
     w_depth = w_raw / w_raw.mean()
 
-    # 1. Quiet Moves KL (Filtered by minimum Monty mass threshold >= 25%)
+    # 1. Quiet Moves DeltaRank Loss (Measures expected rank improvement relative to Master Baseline)
     quiet_mask = legal_mask & (~is_cap_mask)
-    masked_zq = z_quiet.masked_fill(~quiet_mask, -1e4)
-    log_probs_q = F.log_softmax(masked_zq / tau_mp, dim=-1)
     p_q_raw = target_p_mp * quiet_mask.float()
     w_q_pos = p_q_raw.sum(dim=-1)
     has_quiets = (w_q_pos >= 0.25) & (quiet_mask.sum(dim=-1) > 1)
 
-    loss_mp_kl_q = torch.tensor(0.0, device=z_quiet.device)
+    loss_mp_rank_q = torch.tensor(0.0, device=z_quiet.device)
     acc_q = torch.tensor(0.0, device=z_quiet.device)
     if has_quiets.sum() > 0:
-        p_q_norm = p_q_raw[has_quiets] / w_q_pos[has_quiets].unsqueeze(1)
-        loss_q_pos = -(p_q_norm * log_probs_q[has_quiets]).sum(dim=-1)
-        loss_mp_kl_q = (w_depth[has_quiets] * loss_q_pos).mean()
+        zq_sub = z_quiet[has_quiets]
+        zm_sub = z_legacy_mp[has_quiets]
+        pq_sub = p_q_raw[has_quiets]
+        qmask_sub = quiet_mask[has_quiets]
+
+        p_norm = pq_sub / w_q_pos[has_quiets].unsqueeze(1)
+
+        # Pairwise differences: [B_sub, M, M] where entry (b, i, j) is Score(j) - Score(i)
+        # pi(j > i) is the probability that inferior move j is ranked ahead of move i
+        diff_nn = zq_sub.unsqueeze(1) - zq_sub.unsqueeze(2)
+        diff_master = zm_sub.unsqueeze(1) - zm_sub.unsqueeze(2)
+
+        # tau_mp default in z-units: 0.05 (~1600 score units)
+        tau_val = float(tau_mp) if isinstance(tau_mp, (int, float)) else tau_mp.item()
+        tau_eff = max(0.02, min(0.10, tau_val if tau_val < 0.20 else 0.05))
+
+        pi_nn = torch.sigmoid(diff_nn / tau_eff)
+        pi_master = torch.sigmoid(diff_master / tau_eff)
+
+        # Delta-Rank indicator: Δπ(j > i) = π_nn(j > i) - π_0(j > i)
+        delta_pi = pi_nn - pi_master
+
+        # Mask out non-quiet moves and diagonal (self-comparison)
+        mask_pairs = qmask_sub.unsqueeze(1) & qmask_sub.unsqueeze(2)
+        mask_pairs.diagonal(dim1=1, dim2=2).fill_(False)
+
+        # Expected rank change for move i: sum_j delta_pi(j > i)
+        num_quiets = (qmask_sub.sum(dim=-1) - 1.0).clamp(min=1.0)
+        pos_rank_change = (p_norm.unsqueeze(2) * delta_pi * mask_pairs.float()).sum(dim=(1, 2)) / num_quiets
+
+        loss_mp_rank_q = (w_depth[has_quiets] * pos_rank_change).mean()
+
+        masked_zq = z_quiet.masked_fill(~quiet_mask, -1e4)
         acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q_raw[has_quiets].argmax(dim=-1)).float().mean()
 
     # 2. Residual Reductions on physical moves
@@ -555,13 +583,13 @@ def compute_combined_losses(
     loss_lmr_reg = w_lmr.pow(2).mean() if w_lmr is not None else torch.tensor(0.0, device=z_quiet.device)
 
     if train_mode == "movepicker":
-        loss_total = loss_mp_kl_q + mp_reg_coef * loss_mp_reg
+        loss_total = loss_mp_rank_q + mp_reg_coef * loss_mp_reg
     elif train_mode == "lmr":
         loss_total = lmr_loss_coef * loss_lmr_order + lmr_reg_coef * loss_lmr_reg
     else:
-        loss_total = loss_mp_kl_q + mp_reg_coef * loss_mp_reg + lmr_loss_coef * loss_lmr_order + lmr_reg_coef * loss_lmr_reg
+        loss_total = loss_mp_rank_q + mp_reg_coef * loss_mp_reg + lmr_loss_coef * loss_lmr_order + lmr_reg_coef * loss_lmr_reg
 
-    return loss_total, loss_mp_kl_q, loss_lmr_order, loss_mp_reg, loss_lmr_reg, acc_q
+    return loss_total, loss_mp_rank_q, loss_lmr_order, loss_mp_reg, loss_lmr_reg, acc_q
 
 
 def compute_standardized_rollout_metrics(
