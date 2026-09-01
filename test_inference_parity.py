@@ -36,6 +36,9 @@ def simulate_cpp_fixed_point_v5(model_path: str, u_node, t_quiet, t_lmr):
 
     # w_mp (scale 256, range [-512, 512])
     w_mp_cpp = np.clip((out2[0:8] + 8) >> 4, -512, 512)
+    hist_mean_cpp = int(np.sum(w_mp_cpp[0:5]) / 5.0)
+    w_mp_cpp[0:5] -= hist_mean_cpp
+
     # w_lmr (scale 64, range [-128, 128])
     w_lmr_cpp = np.clip((out2[8:16] + 32) >> 6, -128, 128)
 

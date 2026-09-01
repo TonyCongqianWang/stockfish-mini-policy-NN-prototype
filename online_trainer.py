@@ -139,7 +139,8 @@ def run_stockfish_search_worker(
 
     env = os.environ.copy()
     env["SF_LMR_TELEMETRY"] = output_path
-    env["SF_LMR_SAMPLE_INTERVAL"] = str(sample_interval)
+    # Double the sampling rate across searches by halving sample interval
+    env["SF_LMR_SAMPLE_INTERVAL"] = str(max(1, sample_interval // 2))
     env["SF_MININN_USE_MP"] = "1" if use_mp else "0"
     env["SF_MININN_USE_LMR"] = "1" if use_lmr else "0"
     if model_path and os.path.exists(model_path):
@@ -163,12 +164,31 @@ def run_stockfish_search_worker(
             break
 
     for fen in fens_chunk:
+        # Stage 1: Initial 500k-node search to warm up TT & dynamic history tables
         proc.stdin.write(f"position fen {fen}\ngo nodes {nodes_per_fen}\n")
         proc.stdin.flush()
+        best_move = None
         while True:
             line = proc.stdout.readline()
-            if "bestmove" in line or not line:
+            if not line:
                 break
+            line_str = line.strip()
+            if line_str.startswith("bestmove"):
+                tokens = line_str.split()
+                if len(tokens) >= 2:
+                    best_move = tokens[1]
+                break
+
+        # Stage 2: Play the best move onto the board without resetting the state and search resulting position
+        if best_move and best_move != "(none)":
+            proc.stdin.write(f"position fen {fen} moves {best_move}\ngo nodes {nodes_per_fen}\n")
+            proc.stdin.flush()
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                if line.strip().startswith("bestmove"):
+                    break
 
     proc.stdin.write("quit\n")
     proc.stdin.flush()

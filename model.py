@@ -109,8 +109,17 @@ class NodeNetwork(nn.Module):
 
         # 0..7: 8 dynamic residual weights for handcrafted quiet terms (scale 256, range [-512, 512])
         w_mp_raw = torch.clamp(out_float[:, 0:8], -2.0, 2.0)
-        w_mp_q = torch.clamp(torch.floor((out_int[:, 0:8] + 8.0) / 16.0), -512.0, 512.0) / 256.0
-        w_mp = w_mp_raw + (w_mp_q - w_mp_raw).detach()
+        w_mp_q_int = torch.clamp(torch.floor((out_int[:, 0:8] + 8.0) / 16.0), -512.0, 512.0)
+
+        # Mean-preservation across history terms (0..4: main, pawn, cont0, cont1, deep_even)
+        hist_mean_raw = w_mp_raw[:, 0:5].mean(dim=-1, keepdim=True)
+        w_mp_raw_centered = torch.cat([w_mp_raw[:, 0:5] - hist_mean_raw, w_mp_raw[:, 5:8]], dim=-1)
+
+        hist_sum_int = w_mp_q_int[:, 0:5].sum(dim=-1, keepdim=True)
+        hist_mean_int = torch.div(hist_sum_int, 5.0, rounding_mode="trunc")
+        w_mp_q_centered = torch.cat([w_mp_q_int[:, 0:5] - hist_mean_int, w_mp_q_int[:, 5:8]], dim=-1) / 256.0
+
+        w_mp = w_mp_raw_centered + (w_mp_q_centered - w_mp_raw_centered).detach()
 
         # 8..15: 8 dynamic residual weights for LMR terms (scale 64, range [-128, 128])
         w_lmr_raw = torch.clamp(out_float[:, 8:16], -2.0, 2.0)

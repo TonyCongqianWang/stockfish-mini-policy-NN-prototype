@@ -57,7 +57,8 @@ def run_stockfish_telemetry_worker(
 
     env = os.environ.copy()
     env["SF_LMR_TELEMETRY"] = output_path
-    env["SF_LMR_SAMPLE_INTERVAL"] = str(sample_interval)
+    # Double the sampling rate across searches by halving sample interval
+    env["SF_LMR_SAMPLE_INTERVAL"] = str(max(1, sample_interval // 2))
 
     proc = subprocess.Popen(
         [STOCKFISH_BIN],
@@ -77,13 +78,32 @@ def run_stockfish_telemetry_worker(
             break
 
     for idx, fen in enumerate(fens_chunk, 1):
+        # Stage 1: Initial 500k-node search to warm up TT & history tables
         proc.stdin.write(f"position fen {fen}\ngo nodes {nodes_per_fen}\n")
         proc.stdin.flush()
-
+        best_move = None
         while True:
             line = proc.stdout.readline()
-            if "bestmove" in line or not line:
+            if not line:
                 break
+            line_str = line.strip()
+            if line_str.startswith("bestmove"):
+                tokens = line_str.split()
+                if len(tokens) >= 2:
+                    best_move = tokens[1]
+                break
+
+        # Stage 2: Play the best move onto the board with warmed-up state and search resulting position
+        if best_move and best_move != "(none)":
+            proc.stdin.write(f"position fen {fen} moves {best_move}\ngo nodes {nodes_per_fen}\n")
+            proc.stdin.flush()
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                if line.strip().startswith("bestmove"):
+                    break
+
         if idx % 100 == 0 or idx == len(fens_chunk):
             print(f"  [Stockfish Worker {worker_id}] Searched {idx:>5d}/{len(fens_chunk)} FENs ({(idx/len(fens_chunk))*100:.0f}%)", flush=True)
 

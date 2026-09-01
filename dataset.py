@@ -19,6 +19,7 @@ def extract_node_features(
     cut_node: bool = False,
     pv_node: bool = False,
     static_eval: int = 0,
+    static_eval_margin: int = 0,
     prev_stat_score: int = 0,
     cutoff_cnt: int = 1,
     tt_hit: bool = False,
@@ -53,7 +54,7 @@ def extract_node_features(
     features[8] = np.clip((ply - 24.0) / 16.0, -1.0, 1.0)
     features[9] = 1.0 if improving else -1.0
     features[10] = 1.0 if tt_hit else -1.0
-    features[11] = 1.0 if tt_pv else -1.0
+    features[11] = np.clip(static_eval_margin / 200.0, -1.0, 1.0)
 
     features[12] = np.clip(static_eval / 500.0, -1.0, 1.0)
     features[13] = np.clip(prev_stat_score / 2000.0, -1.0, 1.0)
