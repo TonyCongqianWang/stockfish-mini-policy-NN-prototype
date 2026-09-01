@@ -85,7 +85,7 @@ def extract_quiet_terms_from_data(m_data: dict, ply: int = 16) -> torch.Tensor:
         t[6] = xq[6] * 256.0                  # contHistory[5]
         t[7] = 16384.0 if xq[7] > 0 else 0.0  # check bonus
         t[8] = xq[8] * (18000.0 / 64.0)       # threat bonus/penalty
-        t[9] = xq[9] * 256.0                  # lowPlyHistory
+        t[9] = xq[9] * 2048.0                 # 8 * lowPlyHistory (8 * 256)
     elif "stat_score" in m_data:
         t[0] = float(m_data.get("stat_score", 0))
     return torch.from_numpy(t)

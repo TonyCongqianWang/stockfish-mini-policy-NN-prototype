@@ -561,10 +561,12 @@ def compute_standardized_rollout_metrics(
     is_cap: torch.Tensor,
     legal_mask: torch.Tensor,
     tau_mp: torch.Tensor,
-    tau_lmr: torch.Tensor
+    tau_lmr: torch.Tensor,
+    is_live_rollout: bool = False
 ) -> Dict[str, float]:
     """
     Standardized, canonical metric calculation across all evaluation streams.
+    Adheres strictly to the singular source of truth: the physical order of move evaluations.
     """
     B, M = target_p_mp.shape
     i_star = target_p_mp.argmax(dim=-1)
@@ -578,7 +580,20 @@ def compute_standardized_rollout_metrics(
     has_quiets = (w_q_pos >= 0.25) & (quiet_mask.sum(dim=-1) > 1)
 
     mp_kl_q = -(p_q_raw[has_quiets] * log_probs_q[has_quiets]).sum(dim=-1).mean() if has_quiets.sum() > 0 else torch.tensor(0.0)
-    acc_q = (masked_zq[has_quiets].argmax(dim=-1) == p_q_raw[has_quiets].argmax(dim=-1)).float().mean() if has_quiets.sum() > 0 else torch.tensor(0.0)
+
+    # Ground Truth Physical Move 1 among Quiets (the first quiet move emitted during search)
+    M_range = torch.arange(M, device=target_p_mp.device).unsqueeze(0).expand(B, M)
+    masked_ranks = torch.where(quiet_mask, M_range, torch.tensor(M, device=target_p_mp.device))
+    phys_first_quiet = masked_ranks.argmin(dim=-1)
+    monty_best_quiet = p_q_raw.argmax(dim=-1)
+    phys_quiet_match = (phys_first_quiet[has_quiets] == monty_best_quiet[has_quiets]).float().mean() if has_quiets.sum() > 0 else torch.tensor(0.0)
+
+    # Model Scored Quiet Top-1 Match (offline score evaluation)
+    model_best_quiet = masked_zq.argmax(dim=-1)
+    acc_q = (model_best_quiet[has_quiets] == monty_best_quiet[has_quiets]).float().mean() if has_quiets.sum() > 0 else torch.tensor(0.0)
+
+    # For live search rollouts & Master baseline, the ground truth is physical search emission order
+    reported_quiet_top1 = phys_quiet_match if is_live_rollout else acc_q
 
     # 2. Search Effort & Allocation
     r_real_clean = r_real.clone()
@@ -611,7 +626,9 @@ def compute_standardized_rollout_metrics(
 
     return {
         "top1_match": top1_match.item() * 100.0,
-        "quiet_top1": acc_q.item() * 100.0,
+        "quiet_top1": reported_quiet_top1.item() * 100.0,
+        "phys_quiet_top1": phys_quiet_match.item() * 100.0,
+        "model_quiet_top1": acc_q.item() * 100.0,
         "cpp1_in_m3_match": m1_in_top3.item() * 100.0,
         "m1_in_cpp3_match": top1_in_m3.item() * 100.0,
         "mp_kl_q": mp_kl_q.item(),
@@ -670,7 +687,8 @@ def evaluate_handcrafted_master(
                 is_cap=is_cap,
                 legal_mask=legal_mask,
                 tau_mp=tau_mp_t,
-                tau_lmr=tau_lmr_t
+                tau_lmr=tau_lmr_t,
+                is_live_rollout=True
             )
 
             total_count += B
@@ -688,7 +706,8 @@ def evaluate_validation_rollout(
     lmr_ord_coef: float = 0.40,
     rank_profile_coef: float = 0.40,
     tau_lmr: float = 1.5,
-    train_mode: str = "both"
+    train_mode: str = "both",
+    is_live_rollout: bool = False
 ) -> Dict[str, float]:
     model.eval()
     tot_loss_sum, w_anc_sum, rank_prof_loss_sum = 0.0, 0.0, 0.0
@@ -719,7 +738,8 @@ def evaluate_validation_rollout(
                 is_cap=is_cap,
                 legal_mask=legal_mask,
                 tau_mp=tau_mp,
-                tau_lmr=tau_lmr
+                tau_lmr=tau_lmr,
+                is_live_rollout=is_live_rollout
             )
 
             B = u_node.size(0)
@@ -1370,7 +1390,8 @@ def train_single_run(
             live_stats = evaluate_validation_rollout(
                 model, fresh_loader,
                 mp_anchor_coef=mp_anchor_coef, lmr_ord_coef=lmr_ord_coef, rank_profile_coef=rank_profile_coef,
-                tau_lmr=tau_student_lmr, train_mode=train_mode
+                tau_lmr=tau_student_lmr, train_mode=train_mode,
+                is_live_rollout=True
             )
 
             # Maintain sliding replay window across iterations
