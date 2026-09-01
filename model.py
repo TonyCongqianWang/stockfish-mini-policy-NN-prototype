@@ -160,10 +160,10 @@ class DualMiniNN(nn.Module):
         delta_score_int = torch.floor(((t_quiet * torch.round(w_exp_mp * 256.0)).sum(dim=-1) + 128.0) / 256.0)
         quiet_scores = base_score + delta_score_float + (delta_score_int - delta_score_float).detach()
 
-        # 2. Residual combination of 8 LMR terms
+        # 2. Residual combination of 8 LMR terms (Scale to exact plies: 1024 units = 1.0 ply, 64 units = 1/16 ply)
         w_exp_lmr = w_lmr.unsqueeze(1)
-        delta_r_float = (t_lmr * w_exp_lmr).sum(dim=-1)
-        delta_r_int = torch.floor(((t_lmr * torch.round(w_exp_lmr * 64.0)).sum(dim=-1) + 32.0) / 64.0)
+        delta_r_float = (t_lmr * w_exp_lmr).sum(dim=-1) / 16.0
+        delta_r_int = (torch.floor(((t_lmr * torch.round(w_exp_lmr * 64.0)).sum(dim=-1) + 32.0) / 64.0)) / 16.0
         delta_r_nn = delta_r_float + (delta_r_int - delta_r_float).detach()
 
         return w_mp, w_lmr, tau_mp, tau_lmr, quiet_scores, delta_r_nn

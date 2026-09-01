@@ -44,8 +44,8 @@ def simulate_cpp_fixed_point_v5(model_path: str, u_node, t_quiet, t_lmr):
     delta_sum = int(np.sum(np.round(t_quiet) * w_mp_cpp))
     score_quiet_cpp = base_score + ((delta_sum + 128) >> 8)
 
-    # 3. LMR Forward Pass: 8 residual terms
-    delta_r_int = int(np.floor((np.sum(t_lmr * w_lmr_cpp) + 32.0) / 64.0))
+    # 3. LMR Forward Pass: 8 residual terms (in plies: 1024 units = 1.0 ply, 64 units = 1/16 ply)
+    delta_r_int = float(int(np.floor((np.sum(t_lmr * w_lmr_cpp) + 32.0) / 64.0))) / 16.0
     delta_r_cpp = float(delta_r_int)
 
     return w_mp_cpp, w_lmr_cpp, score_quiet_cpp, delta_r_cpp
